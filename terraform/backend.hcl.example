@@ -1,0 +1,7 @@
+# Copy to backend.hcl (git-ignored) and run: terraform init -backend-config=backend.hcl
+# Values come from `terraform output` in terraform/bootstrap.
+bucket         = "tfstate-<account-id>-us-east-1"
+key            = "fastapi-postgres/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "terraform-locks"
+encrypt        = true

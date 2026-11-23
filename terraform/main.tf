@@ -9,6 +9,8 @@ locals {
   # separate range starting at 100 so adding AZs never shifts existing subnets.
   public_subnet_cidrs  = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i)]
   private_subnet_cidrs = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 8, i + 100)]
+
+  certificate_arn = var.domain_name != null ? module.dns[0].certificate_arn : var.certificate_arn
 }
 
 module "vpc" {
@@ -37,8 +39,27 @@ module "alb" {
   vpc_id            = module.vpc.vpc_id
   public_subnet_ids = module.vpc.public_subnet_ids
   target_port       = var.container_port
-  certificate_arn   = var.certificate_arn
-  tags              = var.tags
+  enable_https      = var.domain_name != null || var.certificate_arn != null
+  certificate_arn   = local.certificate_arn
+
+  additional_certificate_arns = var.domain_name != null ? module.dns[0].additional_certificate_arns : []
+  tags                        = var.tags
+}
+
+# DNS and certificate lookup: only when a domain is configured. Certificates
+# are pre-existing (not requested here) and must be in this region.
+module "dns" {
+  count  = var.domain_name != null ? 1 : 0
+  source = "./modules/dns"
+
+  domain_name       = var.domain_name
+  alternative_names = var.domain_alternative_names
+  zone_name         = coalesce(var.dns_zone_name, var.domain_name)
+  alb_dns_name      = module.alb.dns_name
+  alb_zone_id       = module.alb.zone_id
+
+  # Existing ACM certificates in this region: apex first (default), wildcard second.
+  certificate_domains = [var.domain_name, "*.${var.domain_name}"]
 }
 
 module "rds" {

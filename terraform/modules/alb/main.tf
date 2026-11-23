@@ -1,5 +1,7 @@
 locals {
-  https_enabled = var.certificate_arn != null
+  # A static flag, not "certificate_arn != null": the ARN of a freshly requested
+  # certificate is unknown until apply and cannot drive count/for_each.
+  https_enabled = var.enable_https
 }
 
 resource "aws_security_group" "this" {
@@ -112,4 +114,12 @@ resource "aws_lb_listener" "https" {
     type             = "forward"
     target_group_arn = aws_lb_target_group.this.arn
   }
+}
+
+# for_each keys are positions (static); values may be unknown until apply.
+resource "aws_lb_listener_certificate" "additional" {
+  for_each = local.https_enabled ? { for i, arn in var.additional_certificate_arns : tostring(i) => arn } : {}
+
+  listener_arn    = aws_lb_listener.https[0].arn
+  certificate_arn = each.value
 }

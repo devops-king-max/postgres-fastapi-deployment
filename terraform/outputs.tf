@@ -62,3 +62,8 @@ output "db_read_endpoint" {
   description = "Read replica hostname (null when disabled)."
   value       = module.rds.read_address
 }
+
+output "app_url" {
+  description = "Public URL of the API."
+  value       = var.domain_name != null ? "https://${var.domain_name}" : "http://${module.alb.dns_name}"
+}
