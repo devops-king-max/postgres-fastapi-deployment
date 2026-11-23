@@ -23,6 +23,8 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_domain_name: aethrclothes.shop
   TF_VAR_domain_alternative_names: '["www.aethrclothes.shop"]'
+  # Repository variable holding a JSON list, e.g. ["ops@example.com"].
+  TF_VAR_alarm_emails: ${{ vars.ALARM_EMAILS || '[]' }}
 
 defaults:
   run:

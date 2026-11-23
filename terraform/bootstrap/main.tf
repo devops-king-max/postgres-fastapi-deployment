@@ -166,6 +166,28 @@ data "aws_iam_policy_document" "apply" {
     resources = ["*"]
   }
 
+  # Notifying alarms and their topic, limited to names starting with the app name.
+  statement {
+    sid = "AppAlarms"
+    actions = [
+      "cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms", "cloudwatch:TagResource",
+      "cloudwatch:UntagResource", "cloudwatch:ListTagsForResource",
+    ]
+    resources = ["arn:aws:cloudwatch:${var.aws_region}:${local.account_id}:alarm:${var.app_name}-*"]
+  }
+
+  statement {
+    sid       = "DescribeAlarms"
+    actions   = ["cloudwatch:DescribeAlarms"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "AppTopics"
+    actions   = ["sns:*"]
+    resources = ["arn:aws:sns:${var.aws_region}:${local.account_id}:${var.app_name}-*"]
+  }
+
   statement {
     sid = "AppIamOnly"
     actions = [

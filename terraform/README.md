@@ -29,6 +29,7 @@ the monthly cost (about $197 with the defaults; Aurora instances are $107 of it)
 | `modules/alb` | Public Application Load Balancer, target group, listeners |
 | `modules/rds` | Aurora PostgreSQL cluster, writer + readers spread over AZs, security group |
 | `modules/ecs` | Cluster, task definition, service, IAM roles, logs, autoscaling |
+| `modules/monitoring` | SNS alarm topic (email), CloudWatch alarms, Route 53 health check on `/db-check` |
 
 ## Prerequisites
 
@@ -57,6 +58,7 @@ Defaults work out of the box. Override with `-var` or a `terraform.tfvars` file 
 | `db_instance_class` | `db.t4g.medium` | Smallest provisioned Aurora PostgreSQL class |
 | `db_engine_version` | `17.9` | Aurora PostgreSQL major.minor |
 | `db_deletion_protection` | `false` | Set `true` in production (also keeps a final snapshot) |
+| `alarm_emails` | `[]` | Emails for alarm notifications; each must click the AWS confirmation link. CI reads it from the `ALARM_EMAILS` repository variable |
 
 For a cheap dev environment: `-var db_instance_count=1` (writer only, no
 readable failover target).
@@ -151,6 +153,25 @@ Aurora promotes the reader and the cluster endpoint (`DB_HOST`) follows it,
 typically within a minute. Watch `/db-check` recover, then run the
 `describe-db-clusters` command again: the writer flag has moved.
 
+### Alarms and notifications
+
+```bash
+# State of every notifying alarm (OK, ALARM or INSUFFICIENT_DATA)
+aws cloudwatch describe-alarms --alarm-name-prefix fastapi-postgres- \
+  --query 'MetricAlarms[].[AlarmName,StateValue]' --output table
+
+# Email subscriptions: "PendingConfirmation" until the link in the AWS email is clicked
+aws sns list-subscriptions-by-topic --topic-arn "$(terraform output -raw alarm_topic_arn)" \
+  --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output table
+
+# End-to-end test of the notification path (sends ALARM, then the real state returns)
+aws cloudwatch set-alarm-state --alarm-name fastapi-postgres-target-5xx \
+  --state-value ALARM --state-reason "manual notification test"
+```
+
+New alarms start in `INSUFFICIENT_DATA` until their metric has data points; the
+`/db-check` health check needs a couple of minutes after creation.
+
 ## Known limitations
 
 - **Password rotation breaks running tasks.** RDS rotates the managed password
@@ -160,6 +181,7 @@ typically within a minute. Watch `/db-check` recover, then run the
   `aws ecs update-service --cluster <ecs_cluster_name> --service <ecs_service_name> --force-new-deployment`.
   The lasting fix is for the app to read the secret when it connects. Check the
   schedule with `aws secretsmanager describe-secret --secret-id <db_secret_arn>`.
+  The `db-check-failing` alarm detects this case within about two minutes.
 - The app sends every query to `DB_HOST` (the writer). `DB_READ_HOST` (reader
   endpoint) is injected but unused until the app routes `SELECT`s to it.
 - Why Aurora and not an RDS instance plus read replica:
@@ -224,7 +246,14 @@ terraform output                      # note state_bucket, plan_role_arn, apply_
 gh variable set TF_STATE_BUCKET   --body "<state_bucket>"
 gh variable set AWS_PLAN_ROLE_ARN  --body "<plan_role_arn>"
 gh variable set AWS_APPLY_ROLE_ARN --body "<apply_role_arn>"
+
+# Optional: alarm recipients as a JSON list (unset = alarms without notifications)
+gh variable set ALARM_EMAILS --body '["ops@example.com"]'
 ```
+
+The apply role may create CloudWatch alarms and SNS topics only with names that
+start with the app name. After changing `bootstrap/main.tf`, re-run
+`terraform apply` there locally: CI cannot change its own role.
 
 If the account already has a GitHub OIDC provider, run bootstrap with
 `-var create_github_oidc_provider=false`. For a manual approval gate, add
