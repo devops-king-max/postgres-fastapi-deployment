@@ -100,7 +100,9 @@ def health():
     }
 
 
+# /db-check is an alias of /ready, kept for parity with compose-demo.
 @app.get("/ready")
+@app.get("/db-check")
 def ready():
     try:
         conn = get_connection()
