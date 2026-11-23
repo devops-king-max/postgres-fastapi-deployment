@@ -16,6 +16,18 @@ variable "github_repo" {
   default     = "postgres-fastapi-deployment"
 }
 
+variable "github_owner_id" {
+  description = "Numeric GitHub ID of the owner (gh api repos/OWNER/REPO -q .owner.id)."
+  type        = string
+  default     = "169896095"
+}
+
+variable "github_repo_id" {
+  description = "Numeric GitHub ID of the repository (gh api repos/OWNER/REPO -q .id)."
+  type        = string
+  default     = "1468483451"
+}
+
 variable "deploy_branch" {
   description = "Only this branch may assume the apply role."
   type        = string

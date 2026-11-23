@@ -16,7 +16,11 @@ data "aws_caller_identity" "current" {}
 locals {
   account_id  = data.aws_caller_identity.current.account_id
   bucket_name = "tfstate-${local.account_id}-${var.aws_region}"
-  repo        = "${var.github_owner}/${var.github_repo}"
+  # GitHub's OIDC `sub` claim carries immutable numeric IDs for the owner and the
+  # repository (owner@ID/repo@ID). Matching them also means a renamed or transferred
+  # repository can no longer assume these roles. Observed in CloudTrail on the
+  # first failed run; find the IDs with: gh api repos/<owner>/<repo> -q '.owner.id, .id'
+  repo        = "${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}"
   name_prefix = var.app_name
 }
 
