@@ -45,7 +45,7 @@ locals {
 
 # Terraform sets the password itself (manage_master_user_password = false):
 # an RDS instance read replica cannot be created when RDS manages the master
-# password (docs/read-replica-deferred.md). The cost of this choice: the
+# password (DESIGN.md, Database). The cost of this choice: the
 # password is stored in Terraform state, and nothing rotates it.
 resource "aws_db_instance" "this" {
   identifier = "${var.name}-db"

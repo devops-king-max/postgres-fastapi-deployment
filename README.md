@@ -1,648 +1,304 @@
-# FastAPI PostgreSQL Deployment with Docker and Kubernetes
+# FastAPI + PostgreSQL on AWS (ECS Fargate, RDS, Terraform)
 
-This repository demonstrates two practical ways to run a **FastAPI application with PostgreSQL**:
+This repository deploys the `k8s-event-api` FastAPI service to AWS with Terraform:
 
-1. **Docker Compose** for local development
-2. **Kubernetes manifests** for a cluster-based deployment
-
-The goal is to show the deployment path of a small backend service from a local containerized setup to a Kubernetes environment. The project focuses on containerization, service-to-service communication, database connectivity, configuration management, secrets, persistent storage, and basic readiness checks.
-
----
-
-## Repository Structure
+- ECS Fargate tasks in two Availability Zones, behind an HTTPS Application Load Balancer.
+- An RDS PostgreSQL Multi-AZ primary for writes and one read replica for reads, both in private subnets.
+- CloudWatch alarms that send email notifications.
+- A GitHub Actions pipeline that authenticates to AWS with OIDC (no stored AWS keys).
 
 ```text
-postgres-fastapi-deployment/
-├── compose-demo/
-│   ├── app/
-│   │   └── main.py
-│   ├── Dockerfile
-│   ├── docker-compose.yml
-│   └── requirements.txt
-│
-└── k8s-event-api/
-    ├── app/
-    │   └── main.py
-    ├── Dockerfile
-    ├── requirements.txt
-    └── k8s-yamls/
-        ├── namespace.yaml
-        ├── configmap.yaml
-        ├── secrets.yaml
-        ├── pvc.yaml
-        ├── postgres-deployment.yaml
-        ├── postgres-service.yaml
-        ├── fastapi-deployment.yaml
-        └── service.yaml
+Clients ── Route 53 (aethrclothes.shop) ──► ALB :443 (public subnets, 2 AZs)
+                                              │ :8000
+                                              ▼
+                              ECS Fargate tasks (private subnets, 2 AZs)
+                                              │ :5432
+                                              ▼
+              RDS PostgreSQL primary (DB_HOST, Multi-AZ standby) ──async──► read replica (DB_READ_HOST)
 ```
 
----
+| Document | Content |
+|---|---|
+| This README | Deployment, verification and cleanup |
+| [terraform/DESIGN.md](terraform/DESIGN.md) | Architecture, design decisions and estimated AWS costs (about $130/month) |
+| [terraform/README.md](terraform/README.md) | Terraform variables, modules and operational detail |
+| [docs/local-docker-and-kubernetes.md](docs/local-docker-and-kubernetes.md) | Running the app locally with Docker Compose or Kubernetes |
 
-## What This Project Covers
+## Repository layout
 
-- Building a Python/FastAPI application as a Docker image
-- Running FastAPI and PostgreSQL together with Docker Compose
-- Connecting one container to another by service name
-- Reading database configuration from environment variables
-- Deploying FastAPI and PostgreSQL on Kubernetes
-- Using Kubernetes `Deployment`, `Service`, `ConfigMap`, `Secret`, `Namespace`, and `PersistentVolumeClaim`
-- Exposing the API with a `NodePort` service
-- Checking application and database readiness through API endpoints
+| Path | Purpose |
+|---|---|
+| `k8s-event-api/` | The FastAPI application and its Dockerfile (the image that is deployed) |
+| `terraform/` | Root Terraform stack: `vpc`, `alb`, `ecs`, `ecr`, `rds`, `dns`, `monitoring` modules |
+| `terraform/bootstrap/` | One-time stack: S3 state bucket, DynamoDB lock table, GitHub OIDC provider, CI roles |
+| `.github/workflows/deploy.yml` | Plan on pull requests, build and apply on `main` |
+| `compose-demo/` | Local Docker Compose demo (not deployed to AWS) |
 
----
+## Prerequisites
 
-# Part 1 — Docker Compose Demo
-
-The first part of the project runs a simple FastAPI service and a PostgreSQL database locally with Docker Compose.
-
-## Architecture
-
-```text
-Browser / curl
-     |
-     v
-FastAPI container
-     |
-     v
-PostgreSQL container
-```
-
-Docker Compose creates both services on the same network. The FastAPI application can reach the database using the database service name:
-
-```python
-host=os.getenv("DB_HOST", "db")
-```
-
-In the Compose setup, the PostgreSQL service is named `db`, so the application connects to PostgreSQL through `db:5432`.
-
-## Files
-
-```text
-compose-demo/
-├── app/main.py
-├── Dockerfile
-├── docker-compose.yml
-└── requirements.txt
-```
-
-## FastAPI Endpoints
-
-The Compose demo includes a small FastAPI application with these endpoints:
-
-| Endpoint | Method | Description |
-|---|---:|---|
-| `/` | GET | Checks whether the FastAPI app is running |
-| `/health` | GET | Basic application health check |
-| `/db-check` | GET | Connects to PostgreSQL and runs `SELECT 1` |
-
-## Dockerfile
-
-The Dockerfile uses a lightweight Python image, installs the dependencies, copies the application code, exposes port `8000`, and starts Uvicorn.
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY app/ .
-
-EXPOSE 8000
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-## docker-compose.yml
-
-The Compose file defines two services:
-
-- `web`: the FastAPI application
-- `db`: the PostgreSQL database
-
-PostgreSQL data is stored in a named Docker volume called `postgres_data`.
-
-```yaml
-services:
-  web:
-    build: .
-    depends_on:
-      - db
-    ports:
-      - "6161:8000"
-
-  db:
-    image: postgres:15-alpine
-    volumes:
-      - postgres_data:/var/lib/postgresql/data/
-    environment:
-      - POSTGRES_USER=ekrem
-      - POSTGRES_PASSWORD=ekrem6161
-      - POSTGRES_DB=demo_db
-
-volumes:
-  postgres_data:
-```
-
-> Note: These credentials are for local demo purposes only. In real projects, database credentials should not be committed directly into source control.
-
-## Run the Docker Compose Demo
-
-From the project root:
+- An AWS account and credentials with administrator access, for the one-time bootstrap.
+- AWS CLI v2, Terraform `>= 1.4`, Docker, and the GitHub CLI (`gh`).
+- For HTTPS: a Route 53 hosted zone for the domain and ISSUED ACM certificates in
+  `us-east-1` for the apex and the wildcard (`aethrclothes.shop`,
+  `*.aethrclothes.shop`). Terraform looks them up; it does not request them.
+  Without a domain, leave `domain_name` unset: the API is then served over plain
+  HTTP on the ALB DNS name.
 
 ```bash
-cd compose-demo
+export AWS_PROFILE=<your-profile> AWS_REGION=us-east-1
+aws sts get-caller-identity        # confirm the intended account before creating anything
 ```
 
-Start the application and database:
+## Deployment
+
+### Step 1: One-time setup
+
+The bootstrap stack creates what the pipeline needs before it can run: the
+remote state bucket, the lock table, the GitHub OIDC provider and two IAM roles.
+A pull request uses the read-only plan role; `main` uses the apply role.
 
 ```bash
-docker compose up --build
+cd terraform/bootstrap
+terraform init
+terraform apply                    # add -var create_github_oidc_provider=false if the account already has one
+terraform output                   # note state_bucket, plan_role_arn, apply_role_arn
 ```
 
-Test the application:
+Configure the GitHub repository:
 
 ```bash
-curl http://localhost:6161/
+# Repository variables (identifiers, not credentials)
+gh variable set TF_STATE_BUCKET    --body "<state_bucket>"
+gh variable set AWS_PLAN_ROLE_ARN  --body "<plan_role_arn>"
+gh variable set AWS_APPLY_ROLE_ARN --body "<apply_role_arn>"
+gh variable set ALARM_EMAILS       --body '["ops@example.com"]'   # optional: alarm recipients
+
+# Repository secret: the database master password.
+# If it is not set, Terraform generates a random password.
+gh secret set DB_PASSWORD          # prompts for the value, so it stays out of shell history
 ```
 
-Expected response:
+In **Settings > Environments**, create the `production` environment and set its
+deployment branches to `main` only. The apply role trusts only jobs that run in
+that environment.
 
-```json
-{
-  "message": "FastAPI is running"
-}
-```
+### Step 2a: Deploy with GitHub Actions (recommended)
 
-Test the health endpoint:
+Merge a change to `main` that touches `terraform/`, `k8s-event-api/` or the
+workflow, or start the workflow by hand:
 
 ```bash
-curl http://localhost:6161/health
+gh workflow run deploy --ref main
+gh run watch                       # follow the run
 ```
 
-Expected response:
+The `deploy` job runs these steps in order:
 
-```json
-{
-  "status": "ok"
-}
-```
+1. Create the ECR repository.
+2. Build the image, tagged with the commit SHA (`linux/amd64`), and push it.
+3. Run `terraform apply`.
+4. Wait until the ECS service is stable.
+5. Smoke-test `/health` and `/db-check`.
 
-Test the PostgreSQL connection:
+The first deploy takes about 25 to 35 minutes, mostly for the RDS primary and
+then the replica. Each alarm recipient gets an "AWS Notification - Subscription
+Confirmation" email and must click the link to receive alarms.
+
+### Step 2b: Deploy from your machine
+
+Use this when you work without the pipeline. The same remote state is used, so
+never run it while a pipeline run is in progress.
 
 ```bash
-curl http://localhost:6161/db-check
+cd terraform
+cp backend.hcl.example backend.hcl            # fill in the bucket from the bootstrap output
+terraform init -backend-config=backend.hcl
+
+# The same inputs the pipeline sets. Without the domain variables, the plan
+# removes HTTPS and the DNS records.
+export TF_VAR_domain_name=aethrclothes.shop
+export TF_VAR_domain_alternative_names='["www.aethrclothes.shop"]'
+export TF_VAR_alarm_emails='["ops@example.com"]'
+export TF_VAR_db_password='<password>'        # 8-128 printable characters, no / " @ or spaces
+
+# 1. The ECR repository must exist before an image can be pushed
+terraform apply -target=module.ecr
+
+# 2. Build and push the image. --platform must match cpu_architecture (X86_64).
+REPO=$(terraform output -raw ecr_repository_url)
+TAG=$(git rev-parse --short HEAD)
+aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%%/*}"
+docker build --platform linux/amd64 -t "$REPO:$TAG" ../k8s-event-api
+docker push "$REPO:$TAG"
+
+# 3. Everything else
+terraform apply -var image_tag="$TAG"
 ```
 
-Expected response:
+## Verification
 
-```json
-{
-  "db_status": "ok",
-  "result": 1
-}
-```
-
-Stop the environment:
+Run these commands from `terraform/` after the deploy. They need the backend
+initialised as in step 2b; `terraform output` then works without the other
+variables.
 
 ```bash
-docker compose down
+URL=$(terraform output -raw app_url)                  # https://aethrclothes.shop
+CLUSTER=$(terraform output -raw ecs_cluster_name)
+SERVICE=$(terraform output -raw ecs_service_name)
+DB_ID=$(terraform output -raw db_instance_identifier)
 ```
 
-Remove the PostgreSQL volume as well:
+**1. The ECS service is stable, with 2 running tasks in different AZs**
 
 ```bash
-docker compose down -v
+aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+  --query 'services[0].{desired:desiredCount,running:runningCount,rollout:deployments[0].rolloutState}'
+aws ecs describe-tasks --cluster "$CLUSTER" \
+  --tasks $(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --query 'taskArns' --output text) \
+  --query 'tasks[].[availabilityZone,lastStatus,healthStatus]' --output table
 ```
 
----
+Expected: `running` equals `desired` (2), `rollout` is `COMPLETED`, and the
+tasks are in two different AZs.
 
-# Part 2 — Kubernetes Event API
-
-The second part deploys a more complete FastAPI application and PostgreSQL database on Kubernetes.
-
-This version is closer to a real deployment structure. It separates application configuration, database secrets, persistent storage, internal database networking, and external API exposure.
-
-## Architecture
-
-```text
-Browser / curl
-     |
-     v
-NodePort Service: k8s-event-api-service
-     |
-     v
-FastAPI Deployment
-  replicas: 3
-     |
-     v
-ClusterIP Service: postgres-service
-     |
-     v
-PostgreSQL Deployment
-     |
-     v
-PersistentVolumeClaim
-```
-
-The FastAPI application talks to PostgreSQL through the Kubernetes service name:
-
-```text
-postgres-service:5432
-```
-
-This is defined in the ConfigMap:
-
-```yaml
-DB_HOST: postgres-service
-DB_PORT: "5432"
-```
-
-## Files
-
-```text
-k8s-event-api/
-├── app/main.py
-├── Dockerfile
-├── requirements.txt
-└── k8s-yamls/
-    ├── namespace.yaml
-    ├── configmap.yaml
-    ├── secrets.yaml
-    ├── pvc.yaml
-    ├── postgres-deployment.yaml
-    ├── postgres-service.yaml
-    ├── fastapi-deployment.yaml
-    └── service.yaml
-```
-
-## Kubernetes Objects
-
-| File | Kubernetes Object | Purpose |
-|---|---|---|
-| `namespace.yaml` | `Namespace` | Isolates the application resources in `k8s-event-api` namespace |
-| `configmap.yaml` | `ConfigMap` | Stores non-sensitive app and database configuration |
-| `secrets.yaml` | `Secret` | Stores the PostgreSQL password |
-| `pvc.yaml` | `PersistentVolumeClaim` | Provides persistent storage for PostgreSQL data |
-| `postgres-deployment.yaml` | `Deployment` | Runs the PostgreSQL container |
-| `postgres-service.yaml` | `Service` | Exposes PostgreSQL inside the cluster with `ClusterIP` |
-| `fastapi-deployment.yaml` | `Deployment` | Runs the FastAPI application with 3 replicas |
-| `service.yaml` | `Service` | Exposes FastAPI outside the cluster with `NodePort` |
-
-## FastAPI Application Features
-
-The Kubernetes version includes a small event API.
-
-### Application endpoints
-
-| Endpoint | Method | Description |
-|---|---:|---|
-| `/` | GET | Returns app name, environment, version, and pod name |
-| `/health` | GET | Basic health check |
-| `/ready` | GET | Checks PostgreSQL connectivity with `SELECT 1` |
-| `/info` | GET | Shows runtime configuration such as app name, environment, DB host, and pod name |
-| `/events` | POST | Inserts a new event into PostgreSQL |
-| `/events` | GET | Lists the latest events from PostgreSQL |
-| `/stats` | GET | Returns basic event statistics |
-
-### Database table
-
-On startup, the application creates the `events` table if it does not exist:
-
-```sql
-CREATE TABLE IF NOT EXISTS events (
-    id SERIAL PRIMARY KEY,
-    source VARCHAR(100) NOT NULL,
-    event_type VARCHAR(100) NOT NULL,
-    payload TEXT,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-```
-
-This keeps the demo self-contained: once PostgreSQL is reachable, the API can initialize the required table automatically.
-
----
-
-## Build the FastAPI Image
-
-From the project root:
+**2. The API answers over HTTPS**
 
 ```bash
-cd k8s-event-api
+curl -s "$URL/health"          # {"status":"ok",...}                 liveness, no database access
+curl -s "$URL/db-check"        # {"status":"ready","db_check":1,...}  the app reaches PostgreSQL
+curl -s "$URL/info"            # app name, environment, version (commit SHA), DB host
+
+curl -s -X POST "$URL/events" -H 'Content-Type: application/json' \
+  -d '{"source":"readme","event_type":"verify","payload":"{}"}'      # write path
+curl -s "$URL/events?limit=5"                                        # read path
+curl -s "$URL/stats"
 ```
 
-Build the Docker image:
+**3. HTTPS is enforced**
 
 ```bash
-docker build -t fastapi-event-api:latest .
+curl -sI "http://aethrclothes.shop/health" | head -3    # 301, Location: https://...
+curl -svo /dev/null "$URL/health" 2>&1 | grep -E 'SSL connection|subject:|expire'
 ```
 
-The Kubernetes deployment uses:
-
-```yaml
-image: fastapi-event-api:latest
-imagePullPolicy: Never
-```
-
-This means Kubernetes expects the image to already exist locally on the node.
-
-### If you use Docker Desktop Kubernetes
-
-Building the image normally is usually enough:
+**4. The database is private, Multi-AZ, and has a read replica**
 
 ```bash
-docker build -t fastapi-event-api:latest .
+aws rds describe-db-instances --query \
+  "DBInstances[?starts_with(DBInstanceIdentifier, '$DB_ID')].{id:DBInstanceIdentifier,az:AvailabilityZone,standbyAz:SecondaryAvailabilityZone,multiAz:MultiAZ,source:ReadReplicaSourceDBInstanceIdentifier,public:PubliclyAccessible,encrypted:StorageEncrypted}" \
+  --output table
 ```
 
-### If you use Minikube
+Expected:
+- The primary shows `multiAz: True` and a `standbyAz`.
+- The replica (`<name>-db-replica`) shows `source` = the primary, in a different AZ.
+- Both instances show `public: False` and `encrypted: True`.
 
-Build the image inside the Minikube Docker environment:
+**5. Alarms are in place and notifications are confirmed**
 
 ```bash
-eval $(minikube docker-env)
-docker build -t fastapi-event-api:latest .
+aws cloudwatch describe-alarms --alarm-name-prefix fastapi-postgres- \
+  --query 'MetricAlarms[].[AlarmName,StateValue]' --output table
+aws sns list-subscriptions-by-topic --topic-arn "$(terraform output -raw alarm_topic_arn)" \
+  --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output table
 ```
 
----
+Expected:
+- 10 alarms, all `OK` after a few minutes (new alarms start as `INSUFFICIENT_DATA`).
+- A subscription ARN for each email address, not `PendingConfirmation`.
 
-## Deploy to Kubernetes
-
-Apply the manifests in a safe order.
+To test the notification path end to end, force an alarm. The ALARM email
+arrives at once, and the OK email follows when CloudWatch next evaluates the real
+state.
 
 ```bash
-kubectl apply -f k8s-yamls/namespace.yaml
-kubectl apply -f k8s-yamls/configmap.yaml
-kubectl apply -f k8s-yamls/secrets.yaml
-kubectl apply -f k8s-yamls/pvc.yaml
-kubectl apply -f k8s-yamls/postgres-deployment.yaml
-kubectl apply -f k8s-yamls/postgres-service.yaml
-kubectl apply -f k8s-yamls/fastapi-deployment.yaml
-kubectl apply -f k8s-yamls/service.yaml
+aws cloudwatch set-alarm-state --alarm-name fastapi-postgres-target-5xx \
+  --state-value ALARM --state-reason "manual notification test"
 ```
 
-Or apply the whole folder:
+**6. Application logs reach CloudWatch**
 
 ```bash
-kubectl apply -f k8s-yamls/
+aws logs tail "$(terraform output -raw log_group_name)" --since 15m
 ```
 
-Check the resources:
+**7. Optional: database failover (causes a brief outage)**
 
 ```bash
-kubectl get all -n k8s-event-api
+aws rds reboot-db-instance --db-instance-identifier "$DB_ID" --force-failover
 ```
 
-Check the pods:
+RDS promotes the standby within one to two minutes. `/db-check` recovers without
+any change to the app, and `az` and `standbyAz` in check 4 swap.
 
-```bash
-kubectl get pods -n k8s-event-api
-```
+### Troubleshooting
 
-Expected result:
-
-```text
-postgres-...     Running
-fast-api-...     Running
-fast-api-...     Running
-fast-api-...     Running
-```
-
-Check the services:
-
-```bash
-kubectl get svc -n k8s-event-api
-```
-
-Expected services:
-
-```text
-postgres-service          ClusterIP
-k8s-event-api-service     NodePort
-```
-
----
-
-## Test the Kubernetes Deployment
-
-The FastAPI service is exposed with a NodePort on port `30080`.
-
-```bash
-curl http://localhost:30080/
-```
-
-Expected response example:
-
-```json
-{
-  "message": "Kubernetes Event API is running",
-  "app_name": "eventa-api",
-  "environment": "dev",
-  "version": "1.0.1",
-  "pod": "fast-api-xxxxxxxxxx-xxxxx"
-}
-```
-
-Check application health:
-
-```bash
-curl http://localhost:30080/health
-```
-
-Expected response example:
-
-```json
-{
-  "status": "ok",
-  "pod": "fast-api-xxxxxxxxxx-xxxxx"
-}
-```
-
-Check database readiness:
-
-```bash
-curl http://localhost:30080/ready
-```
-
-Expected response example:
-
-```json
-{
-  "status": "ready",
-  "db_check": 1,
-  "db_host": "postgres-service",
-  "pod": "fast-api-xxxxxxxxxx-xxxxx"
-}
-```
-
-If NodePort access does not work in your local Kubernetes environment, use port-forwarding:
-
-```bash
-kubectl port-forward -n k8s-event-api service/k8s-event-api-service 8080:80
-```
-
-Then test with:
-
-```bash
-curl http://localhost:8080/ready
-```
-
----
-
-## Create and Read Events
-
-Create a new event:
-
-```bash
-curl -X POST http://localhost:30080/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "source": "web-app",
-    "event_type": "page_view",
-    "payload": "{\"page\": \"home\"}"
-  }'
-```
-
-Example response:
-
-```json
-{
-  "id": 1,
-  "source": "web-app",
-  "event_type": "page_view",
-  "payload": "{\"page\": \"home\"}",
-  "created_at": "2026-01-01T12:00:00"
-}
-```
-
-List events:
-
-```bash
-curl http://localhost:30080/events
-```
-
-Limit the result size:
-
-```bash
-curl "http://localhost:30080/events?limit=5"
-```
-
-Get event statistics:
-
-```bash
-curl http://localhost:30080/stats
-```
-
-Example response:
-
-```json
-{
-  "stats": {
-    "total_events": 1,
-    "distinct_sources": 1,
-    "distinct_event_types": 1
-  },
-  "pod": "fast-api-xxxxxxxxxx-xxxxx"
-}
-```
-
----
-
-## Useful Kubernetes Commands
-
-View application logs:
-
-```bash
-kubectl logs -n k8s-event-api deployment/fast-api
-```
-
-View PostgreSQL logs:
-
-```bash
-kubectl logs -n k8s-event-api deployment/postgres
-```
-
-Describe the FastAPI deployment:
-
-```bash
-kubectl describe deployment fast-api -n k8s-event-api
-```
-
-Describe the PostgreSQL deployment:
-
-```bash
-kubectl describe deployment postgres -n k8s-event-api
-```
-
-Enter one of the FastAPI pods:
-
-```bash
-kubectl exec -it deployment/fast-api -n k8s-event-api -- sh
-```
-
-Enter the PostgreSQL pod:
-
-```bash
-kubectl exec -it deployment/postgres -n k8s-event-api -- sh
-```
-
-Check the PostgreSQL service DNS from inside the FastAPI pod:
-
-```bash
-kubectl exec -it deployment/fast-api -n k8s-event-api -- sh
-```
-
-Inside the container:
-
-```bash
-python -c "import socket; print(socket.gethostbyname('postgres-service'))"
-```
-
----
+| Symptom | Where to look |
+|---|---|
+| 502/503 right after deploy | Normal for a minute or two while tasks pass health checks. Then check the target health: `aws elbv2 describe-target-health --target-group-arn <arn>` |
+| Tasks keep stopping | `aws ecs describe-services ... --query 'services[0].events[:10]'` and the stopped-task reason, which the pipeline prints when its wait fails |
+| `exec format error` in the logs | The image was built for the wrong platform; rebuild with `--platform linux/amd64` |
+| `/health` is 200 but `/db-check` is 503 | The database is unreachable, or the password changed after the tasks started. Force a new deployment: `aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment` |
+| Pipeline fails at "Configure AWS credentials" | The job must run in the `production` environment on `main`, and the role ARNs in the repository variables must match the bootstrap outputs |
 
 ## Cleanup
 
-Delete the Kubernetes resources:
+The stack costs money while it exists, mostly for the NAT gateway, the ALB, the
+RDS instances and the Fargate tasks. Cleanup removes the main stack. The
+bootstrap stack can stay: it costs almost nothing, and the pipeline needs it to
+redeploy.
+
+> A push to `main` that touches the watched paths, or a manual workflow run,
+> recreates the whole stack. Disable the workflow first if it must stay down:
+> `gh workflow disable deploy`.
 
 ```bash
-kubectl delete namespace k8s-event-api
+cd terraform
+# Same inputs as the deploy, so the plan matches what exists (step 2b exports)
+
+# 1. Only if db_deletion_protection was set to true: turn it off first.
+#    Pass the running image tag, otherwise the apply rolls the service to :latest.
+TAG=$(aws ecs describe-task-definition --task-definition "$(aws ecs describe-services \
+  --cluster "$(terraform output -raw ecs_cluster_name)" --services "$(terraform output -raw ecs_service_name)" \
+  --query 'services[0].taskDefinition' --output text)" \
+  --query 'taskDefinition.containerDefinitions[0].image' --output text | cut -d: -f2)
+terraform apply -var db_deletion_protection=false -var image_tag="$TAG"
+
+# 2. Empty the ECR repository (Terraform refuses to delete one that holds images).
+#    Repeat until empty: an image index blocks its child manifests on the first pass.
+REPO_NAME=$(terraform output -raw ecr_repository_url | cut -d/ -f2)
+while IDS=$(aws ecr list-images --repository-name "$REPO_NAME" --query 'imageIds[*]' --output json) \
+      && [ "$IDS" != "[]" ]; do
+  aws ecr batch-delete-image --repository-name "$REPO_NAME" --image-ids "$IDS" >/dev/null
+done
+
+# 3. Destroy the stack. The RDS instances take 10 to 15 minutes.
+terraform destroy
 ```
 
-This removes the namespace and all resources inside it.
+With the default `db_deletion_protection = false`, the database is deleted
+without a final snapshot and its data is lost. Take a manual snapshot first if
+the data matters: `aws rds create-db-snapshot`.
 
-For the Docker Compose demo:
+Confirm that nothing is left. Every command should return an empty list:
 
 ```bash
-cd compose-demo
-docker compose down -v
+terraform state list
+aws rds describe-db-instances --query "DBInstances[?starts_with(DBInstanceIdentifier, 'fastapi-postgres')].DBInstanceIdentifier"
+aws ec2 describe-nat-gateways --filter Name=state,Values=available,pending --query 'NatGateways[].NatGatewayId'
+aws elbv2 describe-load-balancers --query "LoadBalancers[?starts_with(LoadBalancerName, 'fastap')].LoadBalancerName"
+aws ecs list-clusters --query 'clusterArns'
+aws cloudwatch describe-alarms --alarm-name-prefix fastapi-postgres- --query 'MetricAlarms[].AlarmName'
+aws route53 list-health-checks --query 'HealthChecks[].Id'
 ```
 
----
+The Route 53 hosted zone and the ACM certificates were not created by this stack,
+so they remain.
 
-## Notes and Improvements
+**Optional: remove the bootstrap stack as well.** Do this only when the project
+is finished; the pipeline cannot run afterwards.
 
-This project is intentionally simple enough to run locally, but it demonstrates patterns that are also used in real platform work.
-
-Possible improvements:
-
-- Add Kubernetes readiness and liveness probes to the FastAPI deployment
-- Add PostgreSQL readiness checks
-- Replace demo secrets with a real secret management solution
-- Add CI/CD pipeline for image build and deployment
-- Add database migrations with Alembic
-- Add structured logging
-- Add Helm chart or Kustomize overlays
-- Add resource requests and limits for PostgreSQL
-- Add Ingress instead of NodePort for a more production-like setup
-
----
-
-## Summary
-
-This repository shows the same application idea in two stages:
-
-1. **Docker Compose stage**: FastAPI and PostgreSQL run locally as containers. This is useful for development and quick testing.
-2. **Kubernetes stage**: FastAPI and PostgreSQL run as Kubernetes workloads. Configuration is separated into ConfigMaps and Secrets, PostgreSQL uses persistent storage, the database is exposed internally with ClusterIP, and the API is exposed externally with NodePort.
-
-The project demonstrates a basic but practical deployment flow for backend and data-platform-style services.
+1. Empty the state bucket, including all object versions (S3 console > bucket > Empty).
+2. Run `terraform destroy` in `terraform/bootstrap`.
+3. Delete the repository variables and the `DB_PASSWORD` secret in GitHub.
