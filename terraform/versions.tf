@@ -8,7 +8,10 @@ terraform {
     }
   }
 
-  # Local state for now. For team use, switch to an S3 backend with a lock table.
+  # Partial S3 backend: bucket, key, region and lock table are supplied at init
+  # time (see backend.hcl.example and the GitHub workflow). The bucket and lock
+  # table are created by terraform/bootstrap.
+  backend "s3" {}
 }
 
 provider "aws" {

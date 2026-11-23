@@ -14,6 +14,9 @@ Internet ──► ALB (public subnets, 2 AZs)
    Credentials: Secrets Manager (generated and owned by RDS)
 ```
 
+See [DESIGN.md](DESIGN.md) for the architecture diagram, design decisions and
+the estimated monthly cost (about $128 with the defaults).
+
 ## Layout
 
 | Path | Purpose |
@@ -180,3 +183,49 @@ aws elbv2 describe-load-balancers --query 'LoadBalancers[].LoadBalancerName'
 
 With `db_deletion_protection=false` the primary is deleted without a final
 snapshot, and all data is lost. Take a manual snapshot first if you need it.
+
+## CI/CD (GitHub Actions)
+
+Workflow: [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml).
+
+| Event | Job | AWS role | Effect |
+|---|---|---|---|
+| Pull request | `plan` | read-only | fmt, validate, plan. Changes nothing |
+| Push to `main` | `deploy` | apply | build image (tag = commit SHA), push to ECR, `terraform apply`, wait for ECS, smoke test `/health` and `/db-check` |
+
+Authentication uses GitHub OIDC, so no AWS keys are stored in GitHub. The apply
+role can only be assumed by the `main` branch.
+
+### One-time setup
+
+```bash
+export AWS_PROFILE=aws-study
+cd terraform/bootstrap
+terraform init && terraform apply     # S3 state bucket, lock table, OIDC provider, 2 roles
+terraform output                      # note state_bucket, plan_role_arn, apply_role_arn
+
+# Repository variables (not secrets: they are identifiers, not credentials)
+gh variable set TF_STATE_BUCKET   --body "<state_bucket>"
+gh variable set AWS_PLAN_ROLE_ARN  --body "<plan_role_arn>"
+gh variable set AWS_APPLY_ROLE_ARN --body "<apply_role_arn>"
+```
+
+If the account already has a GitHub OIDC provider, run bootstrap with
+`-var create_github_oidc_provider=false`. For a manual approval gate, add
+required reviewers to the `production` environment in the repository settings.
+
+### Domain and HTTPS
+
+The workflow sets `domain_name = aethrclothes.shop` (plus `www`). Terraform does
+**not** request certificates: it looks up the existing ISSUED ACM certificates
+`aethrclothes.shop` (default) and `*.aethrclothes.shop` (added via SNI), enables
+the HTTPS listener (HTTP redirects to HTTPS) and creates alias records to the ALB
+in the existing Route 53 hosted zone.
+
+An ALB can only use certificates from its own region, and these certificates live
+in `us-east-1`, so the stack deploys to `us-east-1`. Public ACM certificates cannot
+be copied to another region.
+
+Local runs now need the remote backend: copy `backend.hcl.example` to
+`backend.hcl`, fill it from the bootstrap outputs and run
+`terraform init -backend-config=backend.hcl`.

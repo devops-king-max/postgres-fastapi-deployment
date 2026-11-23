@@ -1,0 +1,117 @@
+name: deploy
+
+on:
+  pull_request:
+    paths: ["terraform/**", "k8s-event-api/**", ".github/workflows/deploy.yml"]
+  push:
+    branches: [main]
+    paths: ["terraform/**", "k8s-event-api/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+# OIDC: the job exchanges its GitHub token for short-lived AWS credentials.
+permissions:
+  id-token: write
+  contents: read
+
+# Never run two applies against the same state, and never cancel one mid-flight.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_domain_name: aethrclothes.shop
+  TF_VAR_domain_alternative_names: '["www.aethrclothes.shop"]'
+
+defaults:
+  run:
+    working-directory: terraform
+
+jobs:
+  plan:
+    # Pull requests: read-only role, plan only. Nothing is changed in AWS.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Format check
+        run: terraform fmt -recursive -check
+
+      - name: Init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=fastapi-postgres/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=terraform-locks" \
+            -backend-config="encrypt=true"
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Plan
+        run: terraform plan -input=false -lock-timeout=5m -var "image_tag=${{ github.sha }}"
+
+  deploy:
+    # main only: build the image, then apply with that exact image tag.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production # add required reviewers here for a manual approval gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=fastapi-postgres/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=terraform-locks" \
+            -backend-config="encrypt=true"
+
+      # The ECR repository must exist before an image can be pushed.
+      - name: Ensure ECR repository
+        run: terraform apply -input=false -auto-approve -lock-timeout=5m -target=module.ecr
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        run: |
+          REPO=$(terraform output -raw ecr_repository_url)
+          # Runner is x86_64, matching the default cpu_architecture (X86_64).
+          docker build --platform linux/amd64 -t "$REPO:${{ github.sha }}" ../k8s-event-api
+          docker push "$REPO:${{ github.sha }}"
+
+      - name: Apply
+        run: terraform apply -input=false -auto-approve -lock-timeout=5m -var "image_tag=${{ github.sha }}"
+
+      - name: Wait for ECS to stabilise
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$(terraform output -raw ecs_cluster_name)" \
+            --services "$(terraform output -raw ecs_service_name)"
+
+      - name: Smoke test
+        run: |
+          URL=$(terraform output -raw app_url)
+          # Retry: a fresh DNS record or ALB target can take a minute to answer.
+          for path in /health /db-check; do
+            curl -fsS --retry 12 --retry-delay 15 --retry-all-errors "$URL$path"
+            echo
+          done

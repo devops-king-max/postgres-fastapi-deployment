@@ -30,10 +30,22 @@ variable "health_check_path" {
   default     = "/health"
 }
 
+variable "enable_https" {
+  description = "Create the HTTPS listener and redirect HTTP to HTTPS. Requires certificate_arn."
+  type        = bool
+  default     = false
+}
+
 variable "certificate_arn" {
-  description = "ACM certificate ARN. When set, enables HTTPS and redirects HTTP to HTTPS."
+  description = "ACM certificate ARN used by the HTTPS listener (may be unknown until apply)."
   type        = string
   default     = null
+}
+
+variable "additional_certificate_arns" {
+  description = "Extra certificates on the HTTPS listener (e.g. a wildcard next to an apex certificate)."
+  type        = list(string)
+  default     = []
 }
 
 variable "ingress_cidr" {

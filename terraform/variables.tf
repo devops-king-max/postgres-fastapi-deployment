@@ -87,6 +87,24 @@ variable "certificate_arn" {
   default     = null
 }
 
+variable "domain_name" {
+  description = "Public domain for the API (e.g. aethrclothes.shop). Enables an ACM certificate, HTTPS and Route 53 alias records. Null keeps plain HTTP."
+  type        = string
+  default     = null
+}
+
+variable "domain_alternative_names" {
+  description = "Extra names on the certificate and alias records."
+  type        = list(string)
+  default     = []
+}
+
+variable "dns_zone_name" {
+  description = "Route 53 hosted zone name. Defaults to domain_name."
+  type        = string
+  default     = null
+}
+
 variable "db_multi_az" {
   description = "Run the primary with a synchronous standby in a second AZ (automatic failover)."
   type        = bool
