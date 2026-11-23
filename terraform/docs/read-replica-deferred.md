@@ -5,7 +5,7 @@
 | Date | 2026-11-23 |
 | Status | Resolved: the database moved from an RDS instance (+ read replica) to an Aurora PostgreSQL cluster (writer + reader) |
 | Requirement | "PostgreSQL in private subnets, Multi-AZ, 1 write + 1 read, failover" |
-| Met by | Aurora writer (AZ a) + reader (AZ b), automatic failover to the reader, master password managed in Secrets Manager |
+| Met by | Aurora writer + reader in different AZs, automatic failover to the reader, master password managed in Secrets Manager |
 
 ## What happened
 
@@ -71,8 +71,9 @@ The database is an Aurora PostgreSQL cluster (`modules/rds`):
 - `aws_rds_cluster` `fastapi-postgres-aurora`, engine `aurora-postgresql` 17.9,
   `manage_master_user_password = true`, encrypted storage, private subnet group.
 - Two `aws_rds_cluster_instance` (`db.t4g.medium`): `-aurora-1` in `us-east-1a`
-  (writer, `promotion_tier` 0) and `-aurora-2` in `us-east-1b` (reader,
-  `promotion_tier` 1).
+  and `-aurora-2` in `us-east-1b`. Aurora picks the writer: after the first
+  deploy it was `-aurora-2`, the reverse of the `promotion_tier` order, so the
+  docs do not name a fixed writer AZ.
 - `DB_HOST` = cluster endpoint (follows the writer after failover);
   `DB_READ_HOST` = reader endpoint. The app currently uses only `DB_HOST`.
 - Root variables `db_multi_az` and `db_create_read_replica` were replaced by
