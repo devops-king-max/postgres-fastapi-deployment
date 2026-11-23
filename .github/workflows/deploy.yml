@@ -110,9 +110,21 @@ jobs:
 
       - name: Wait for ECS to stabilise
         run: |
-          aws ecs wait services-stable \
-            --cluster "$(terraform output -raw ecs_cluster_name)" \
-            --services "$(terraform output -raw ecs_service_name)"
+          CLUSTER=$(terraform output -raw ecs_cluster_name)
+          SERVICE=$(terraform output -raw ecs_service_name)
+          # The waiter gives up after ~10 min with only "Max attempts exceeded".
+          # On failure, print why: service events and stopped-task reasons.
+          if ! aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"; then
+            aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+              --query 'services[0].{running:runningCount,desired:desiredCount,deployments:deployments[].[status,rolloutState,failedTasks],events:events[:10].message}'
+            STOPPED=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
+              --desired-status STOPPED --query 'taskArns[:5]' --output text)
+            if [ -n "$STOPPED" ]; then
+              aws ecs describe-tasks --cluster "$CLUSTER" --tasks $STOPPED \
+                --query 'tasks[].[stoppedReason,containers[0].reason]' --output text
+            fi
+            exit 1
+          fi
 
       - name: Smoke test
         run: |
