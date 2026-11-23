@@ -16,6 +16,8 @@ Internet ──► ALB (public subnets, 2 AZs)
                 (password from the DB_PASSWORD GitHub secret, or generated)
 ```
 
+Summary of design decisions and estimated AWS costs:
+[docs/design-decisions-and-costs.md](docs/design-decisions-and-costs.md).
 See [DESIGN.md](DESIGN.md) for the architecture diagram, design decisions and
 the monthly cost (about $130 with the defaults; the two RDS instances are $42 of it).
 

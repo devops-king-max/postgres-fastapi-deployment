@@ -2,6 +2,7 @@
 
 Design rationale, architecture and estimated monthly cost of the FastAPI on
 ECS Fargate stack. For deploy, verify and cleanup steps see [README.md](README.md).
+A one-page summary is in [docs/design-decisions-and-costs.md](docs/design-decisions-and-costs.md).
 
 ## Architecture
 
