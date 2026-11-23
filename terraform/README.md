@@ -10,8 +10,9 @@ Internet ──► ALB (public subnets, 2 AZs)
                 │  :5432
                 ▼
    Aurora PostgreSQL cluster
-     writer (AZ a)  ── cluster endpoint, DB_HOST
-     reader (AZ b)  ── reader endpoint, DB_READ_HOST; promoted on writer failure
+     writer  ── cluster endpoint, DB_HOST
+     reader  ── reader endpoint, DB_READ_HOST; promoted on writer failure
+     (one instance per AZ; which AZ holds the writer changes on failover)
    Credentials: Secrets Manager (generated and owned by RDS)
 ```
 

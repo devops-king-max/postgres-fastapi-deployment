@@ -229,6 +229,12 @@ resource "aws_ecs_service" "this" {
     ignore_changes = [desired_count]
   }
 
+  # The task definition references the role, not its inline policy, so without
+  # this the service can start tasks while the policy is still being written.
+  # Observed on the first deploy: tasks failed with AccessDenied on the DB secret
+  # and the circuit breaker marked the deployment failed.
+  depends_on = [aws_iam_role_policy.execution]
+
   tags = var.tags
 }
 

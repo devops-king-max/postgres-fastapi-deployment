@@ -67,8 +67,10 @@ resource "aws_rds_cluster" "this" {
   }
 }
 
-# Instance 1 is created first and becomes the writer. Each instance goes to a
-# different AZ, so losing one AZ leaves a reader to promote.
+# Each instance goes to a different AZ, so losing one AZ leaves an instance to
+# promote. Terraform creates the instances in parallel and Aurora picks the first
+# writer (on the first deploy it was instance 2); promotion_tier only orders
+# failover candidates. The writer can also move on every failover.
 resource "aws_rds_cluster_instance" "this" {
   count = var.instance_count
 
