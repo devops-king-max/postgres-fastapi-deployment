@@ -126,3 +126,18 @@ module "ecs" {
   # registers with it, otherwise ECS rejects the service.
   depends_on = [module.alb]
 }
+
+module "monitoring" {
+  source = "./modules/monitoring"
+
+  name                    = var.name
+  alarm_emails            = var.alarm_emails
+  alb_arn_suffix          = module.alb.arn_suffix
+  target_group_arn_suffix = module.alb.target_group_arn_suffix
+  ecs_cluster_name        = module.ecs.cluster_name
+  ecs_service_name        = module.ecs.service_name
+  db_cluster_identifier   = module.rds.cluster_identifier
+  # The /db-check synthetic check needs the public HTTPS name.
+  health_check_fqdn = var.domain_name
+  tags              = var.tags
+}

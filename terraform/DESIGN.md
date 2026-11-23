@@ -20,6 +20,7 @@ writer (port 5432).
 | Data | Aurora PostgreSQL cluster: 1 writer + 1 reader in different AZs | `modules/rds` |
 | Secrets | RDS-managed master secret in Secrets Manager | `modules/rds` |
 | Observability | CloudWatch log group (`/ecs/<name>`) | `modules/ecs` |
+| Alerting | SNS topic (email), 10 CloudWatch alarms, Route 53 health check on `/db-check` | `modules/monitoring` |
 
 The icons are from the AWS Architecture Icons set as bundled in the open-source
 `diagrams` Python package. Use is subject to AWS's icon terms.
@@ -109,8 +110,32 @@ The icons are from the AWS Architecture Icons set as bundled in the open-source
 
 ### Observability
 - Container logs go to CloudWatch with the `awslogs` driver, 30-day retention.
-- CPU-based autoscaling is the only automation today. There are no alarms yet
-  (see below).
+- **Alarms notify through one SNS topic** (`<name>-alarms`) by email, on both
+  ALARM and OK, so the recipient also learns when an incident is over.
+
+  | Alarm | Signal | Fires when |
+  |---|---|---|
+  | `alb-5xx` | ALB `HTTPCode_ELB_5XX_Count` | ≥ 10 in 5 min (no healthy target, timeouts) |
+  | `target-5xx` | ALB `HTTPCode_Target_5XX_Count` | ≥ 10 in 5 min (application errors, `/db-check` 503) |
+  | `unhealthy-targets` | `UnHealthyHostCount` | ≥ 1 for 3 min |
+  | `no-healthy-targets` | `HealthyHostCount` | < 1 for 2 min, or no data: the API is down |
+  | `latency-p95` | `TargetResponseTime` p95 | > 1 s for 15 min |
+  | `ecs-cpu-high` | ECS service `CPUUtilization` | > 85 % for 15 min (autoscaling is not keeping up) |
+  | `ecs-memory-high` | ECS service `MemoryUtilization` | > 85 % for 15 min (autoscaling tracks CPU only) |
+  | `db-cpu-high` | Aurora writer `CPUUtilization` | > 80 % for 15 min |
+  | `db-memory-low` | Aurora writer `FreeableMemory` | < 256 MiB for 15 min |
+  | `db-check-failing` | Route 53 `HealthCheckStatus` | `https://<domain>/db-check` fails for 2 min |
+
+- **Why a Route 53 check on `/db-check`.** The ALB health check uses `/health`,
+  which never touches the database (see Compute). A database outage, or a rotated
+  password that running tasks do not have, therefore leaves every target healthy
+  and no request-based alarm fires unless users happen to hit DB routes. Route 53
+  calls `/db-check` from three regions every 30 s (about 6 requests per minute)
+  and alarms within about two minutes. Route 53 publishes these metrics only in
+  `us-east-1`, which a precondition enforces.
+- Missing data is not a failure for counters (no 5xx is normal), but it is for
+  `HealthyHostCount` and the health check: silence there means nothing is
+  reporting.
 
 ### Code organisation
 - Reusable modules with typed, validated variables and explicit outputs. The root
@@ -157,6 +182,12 @@ earlier RDS design. Each extra Fargate task added by autoscaling costs about
 $9/month while it runs (half of the 18.02 above). The fixed network cost (NAT,
 public IPv4, ALB) is 66.97.
 
+Alerting adds about $2 to $3.75 per month on top of the table (AWS Price List
+API, `us-east-1`, not in the calculator estimates): 10 standard alarms × $0.10,
+and a Route 53 HTTPS health check, free as a basic check of an AWS endpoint plus
+$1.00 for the HTTPS option ($0.75 + $2.00 if Route 53 bills it as a non-AWS
+endpoint). SNS email notifications are free for the first 1,000 per month.
+
 > Calculator figures are on-demand list prices for `us-east-1` and exclude tax,
 > free tier, data transfer out (assumed inside the 100 GB/month free allowance),
 > Aurora backup storage beyond the free allocation, and Fargate public IPs (tasks
@@ -170,7 +201,7 @@ public IPv4, ALB) is 66.97.
 |---|---|
 | HTTPS | Implemented for `aethrclothes.shop`: existing ACM certificates are looked up (not requested) in `us-east-1`, so the stack deploys there |
 | Remote Terraform state (S3) | Implemented: S3 bucket and DynamoDB lock from `terraform/bootstrap` |
-| CI/CD pipeline | Implemented: GitHub Actions with OIDC (`.github/workflows/deploy.yml`). The first full run on `main` applied everything, but its ECS wait timed out: the service started tasks before the execution policy for the new DB secret existed, and the circuit breaker failed the deployment. Fixed with `depends_on` in `modules/ecs`; the service was redeployed manually and is stable. A clean end-to-end run (including the smoke test) is still pending |
-| CloudWatch alarms | Only the two alarms that ECS target tracking creates for autoscaling. No alarms with notifications (5xx, unhealthy targets, DB CPU) |
+| CI/CD pipeline | Implemented: GitHub Actions with OIDC (`.github/workflows/deploy.yml`). The first full run on `main` applied everything, but its ECS wait timed out: the service started tasks before the execution policy for the new DB secret existed, and the circuit breaker failed the deployment. Fixed with `depends_on` in `modules/ecs`; the next run on `main` passed every step, including the ECS wait and the smoke test |
+| CloudWatch alarms with notifications | Implemented: `modules/monitoring` (see Observability). Email recipients come from the `ALARM_EMAILS` repository variable and must confirm the subscription |
 | "1 write, 1 read" | Implemented with Aurora (writer + reader). The app still sends all queries to `DB_HOST`; `DB_READ_HOST` (reader endpoint) is injected but unused |
 | Secret rotation handling | **Open risk:** RDS rotates the managed password every 7 days by default, and tasks read it only at start. Running tasks will fail to open new DB connections after a rotation until they are redeployed. See README |

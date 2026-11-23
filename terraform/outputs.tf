@@ -72,3 +72,13 @@ output "app_url" {
   description = "Public URL of the API."
   value       = var.domain_name != null ? "https://${var.domain_name}" : "http://${module.alb.dns_name}"
 }
+
+output "alarm_topic_arn" {
+  description = "SNS topic for alarm notifications (subscribe more endpoints here)."
+  value       = module.monitoring.sns_topic_arn
+}
+
+output "alarm_names" {
+  description = "CloudWatch alarms that send notifications."
+  value       = module.monitoring.alarm_names
+}

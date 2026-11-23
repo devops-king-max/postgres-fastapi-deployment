@@ -129,6 +129,12 @@ variable "db_deletion_protection" {
   default     = false
 }
 
+variable "alarm_emails" {
+  description = "Emails notified by the CloudWatch alarms (each must confirm the AWS subscription email). Empty = alarms still exist, nobody is notified."
+  type        = list(string)
+  default     = []
+}
+
 variable "tags" {
   description = "Tags applied to all resources."
   type        = map(string)
