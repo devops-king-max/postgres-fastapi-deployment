@@ -105,22 +105,35 @@ variable "dns_zone_name" {
   default     = null
 }
 
-variable "db_instance_count" {
-  description = "Aurora instances: 1 writer + (count - 1) readers, spread over the AZs. 2 = one write, one read, readable failover target."
-  type        = number
-  default     = 2
+variable "db_multi_az" {
+  description = "Synchronous standby for the primary in a second AZ with automatic failover (roughly doubles primary cost)."
+  type        = bool
+  default     = true
+}
+
+variable "db_create_read_replica" {
+  description = "Create one read replica (the read node), placed in the second AZ."
+  type        = bool
+  default     = true
 }
 
 variable "db_instance_class" {
-  description = "Aurora instance class (db.t4g.medium is the smallest provisioned class)."
+  description = "RDS instance class for the primary and the replica."
   type        = string
-  default     = "db.t4g.medium"
+  default     = "db.t4g.micro"
 }
 
 variable "db_engine_version" {
-  description = "Aurora PostgreSQL version (major.minor)."
+  description = "PostgreSQL version. Major only (e.g. 17) lets RDS pick and upgrade the minor."
   type        = string
-  default     = "17.9"
+  default     = "17"
+}
+
+variable "db_password" {
+  description = "DB master password. Null or empty: Terraform generates one. CI passes the DB_PASSWORD GitHub secret. Stored in Terraform state."
+  type        = string
+  default     = null
+  sensitive   = true
 }
 
 variable "db_deletion_protection" {

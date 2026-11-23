@@ -1,4 +1,4 @@
-# Terraform: FastAPI on ECS Fargate with Aurora PostgreSQL
+# Terraform: FastAPI on ECS Fargate with RDS PostgreSQL
 
 Deploys the `k8s-event-api` FastAPI service to AWS:
 
@@ -9,15 +9,15 @@ Internet ──► ALB (public subnets, 2 AZs)
           ECS Fargate tasks (private subnets, 2 AZs) ──► CloudWatch Logs
                 │  :5432
                 ▼
-   Aurora PostgreSQL cluster
-     writer  ── cluster endpoint, DB_HOST
-     reader  ── reader endpoint, DB_READ_HOST; promoted on writer failure
-     (one instance per AZ; which AZ holds the writer changes on failover)
-   Credentials: Secrets Manager (generated and owned by RDS)
+   RDS PostgreSQL
+     primary  ── DB_HOST (writes); Multi-AZ standby in another AZ, failover only
+     replica  ── DB_READ_HOST (reads), second AZ, asynchronous
+   Credentials: Secrets Manager secret written by Terraform
+                (password from the DB_PASSWORD GitHub secret, or generated)
 ```
 
 See [DESIGN.md](DESIGN.md) for the architecture diagram, design decisions and
-the monthly cost (about $197 with the defaults; Aurora instances are $107 of it).
+the monthly cost (about $130 with the defaults; the two RDS instances are $42 of it).
 
 ## Layout
 
@@ -27,7 +27,7 @@ the monthly cost (about $197 with the defaults; Aurora instances are $107 of it)
 | `modules/vpc` | VPC, public/private subnets across AZs, IGW, NAT, route tables |
 | `modules/ecr` | Image repository with scan-on-push and a retention policy |
 | `modules/alb` | Public Application Load Balancer, target group, listeners |
-| `modules/rds` | Aurora PostgreSQL cluster, writer + readers spread over AZs, security group |
+| `modules/rds` | RDS PostgreSQL primary (Multi-AZ) + read replica, credentials secret, security group |
 | `modules/ecs` | Cluster, task definition, service, IAM roles, logs, autoscaling |
 | `modules/monitoring` | SNS alarm topic (email), CloudWatch alarms, Route 53 health check on `/db-check` |
 
@@ -54,14 +54,20 @@ Defaults work out of the box. Override with `-var` or a `terraform.tfvars` file 
 | `cpu_architecture` | `X86_64` | Must match how the image is built |
 | `desired_count` / `max_count` | `2` / `6` | Autoscaling on CPU 60% |
 | `certificate_arn` | `null` | Set to enable HTTPS (HTTP then redirects) |
-| `db_instance_count` | `2` | 1 writer + 1 reader. The reader is also the failover target |
-| `db_instance_class` | `db.t4g.medium` | Smallest provisioned Aurora PostgreSQL class |
-| `db_engine_version` | `17.9` | Aurora PostgreSQL major.minor |
+| `db_multi_az` | `true` | Standby for the primary in another AZ (failover only, serves no reads) |
+| `db_create_read_replica` | `true` | One read replica in the second AZ (`DB_READ_HOST`) |
+| `db_instance_class` | `db.t4g.micro` | Used by the primary and the replica |
+| `db_engine_version` | `17` | Major only; RDS picks and upgrades the minor |
+| `db_password` | `null` | Master password, sensitive. Unset or empty: Terraform generates one. CI reads it from the `DB_PASSWORD` repository secret. Stored in Terraform state |
 | `db_deletion_protection` | `false` | Set `true` in production (also keeps a final snapshot) |
 | `alarm_emails` | `[]` | Emails for alarm notifications; each must click the AWS confirmation link. CI reads it from the `ALARM_EMAILS` repository variable |
 
-For a cheap dev environment: `-var db_instance_count=1` (writer only, no
-readable failover target).
+For a cheap dev environment: `-var db_multi_az=false -var db_create_read_replica=false`
+(one instance, no failover, no read node).
+
+Locally, pass the password through the environment so it stays out of shell
+history and files: `export TF_VAR_db_password=...` (it must be 8-128 printable
+ASCII characters without `/`, `"`, `@` or spaces).
 
 ## Deploy
 
@@ -85,7 +91,7 @@ aws ecr get-login-password --region "$REGION" \
 docker build --platform linux/amd64 -t "$REPO:latest" ../k8s-event-api
 docker push "$REPO:latest"
 
-# 3. Create everything else (the Aurora cluster and instances take roughly 10-20 minutes)
+# 3. Create everything else (the primary and then the replica take roughly 20-30 minutes)
 terraform apply
 ```
 
@@ -133,25 +139,25 @@ aws elbv2 describe-target-health --target-group-arn \
 ### Checking the database setup
 
 ```bash
-DB_CLUSTER=$(terraform output -raw db_cluster_identifier)
-aws rds describe-db-clusters --db-cluster-identifier "$DB_CLUSTER" --query \
-  'DBClusters[0].{status:Status,multiAz:MultiAZ,members:DBClusterMembers[].{id:DBInstanceIdentifier,writer:IsClusterWriter}}'
-aws rds describe-db-instances --filters Name=db-cluster-id,Values="$DB_CLUSTER" --query \
-  'DBInstances[].{id:DBInstanceIdentifier,az:AvailabilityZone,public:PubliclyAccessible}'
+DB_ID=$(terraform output -raw db_instance_identifier)
+aws rds describe-db-instances --query \
+  "DBInstances[?starts_with(DBInstanceIdentifier, '$DB_ID')].{id:DBInstanceIdentifier,az:AvailabilityZone,standbyAz:SecondaryAvailabilityZone,multiAz:MultiAZ,source:ReadReplicaSourceDBInstanceIdentifier,managedSecret:MasterUserSecret,public:PubliclyAccessible}"
 ```
 
-Expect `multiAz: true`, one member with `writer: true` and one with
-`writer: false`, two different AZs, and `public: false` for both.
+Expect the primary with `multiAz: true` and a `standbyAz`, the replica
+(`<name>-db-replica`) with `source` = the primary and an AZ different from the
+primary, `managedSecret: null` for both (Terraform owns the password), and
+`public: false`.
 
 ### Testing failover (optional, causes a brief outage)
 
 ```bash
-aws rds failover-db-cluster --db-cluster-identifier "$DB_CLUSTER"
+aws rds reboot-db-instance --db-instance-identifier "$DB_ID" --force-failover
 ```
 
-Aurora promotes the reader and the cluster endpoint (`DB_HOST`) follows it,
-typically within a minute. Watch `/db-check` recover, then run the
-`describe-db-clusters` command again: the writer flag has moved.
+RDS promotes the standby and the primary endpoint (`DB_HOST`) follows it,
+typically within one to two minutes. Watch `/db-check` recover, then run the
+`describe-db-instances` command again: `az` and `standbyAz` have swapped.
 
 ### Alarms and notifications
 
@@ -174,22 +180,23 @@ New alarms start in `INSUFFICIENT_DATA` until their metric has data points; the
 
 ## Known limitations
 
-- **Password rotation breaks running tasks.** RDS rotates the managed password
-  every 7 days by default, and ECS injects it only when a task starts. After a
-  rotation, running tasks cannot open new DB connections (`/db-check` returns
-  503) until they are redeployed:
+- **The DB password is in Terraform state** (and in the Secrets Manager secret).
+  Anyone who can read the state bucket can read it. Nothing rotates it.
+- **Changing the password needs new tasks.** ECS injects the secret only when a
+  task starts. After changing `DB_PASSWORD`, push a commit (new image tag, so the
+  service rolls out). A re-run of an old workflow run keeps the old tag; then run
   `aws ecs update-service --cluster <ecs_cluster_name> --service <ecs_service_name> --force-new-deployment`.
-  The lasting fix is for the app to read the secret when it connects. Check the
-  schedule with `aws secretsmanager describe-secret --secret-id <db_secret_arn>`.
-  The `db-check-failing` alarm detects this case within about two minutes.
-- The app sends every query to `DB_HOST` (the writer). `DB_READ_HOST` (reader
-  endpoint) is injected but unused until the app routes `SELECT`s to it.
-- Why Aurora and not an RDS instance plus read replica:
-  [docs/read-replica-deferred.md](docs/read-replica-deferred.md).
+  Until then `/db-check` returns 503, and the `db-check-failing` alarm fires within
+  about two minutes.
+- The app sends every query to `DB_HOST` (the primary). `DB_READ_HOST` (replica)
+  is injected but unused until the app routes `SELECT`s to it. Replication is
+  asynchronous, so reads from the replica can lag behind writes.
+- Why the password is not managed by RDS:
+  [DESIGN.md](DESIGN.md#database).
 
 ## Cleanup
 
-Costs accrue while the stack exists (NAT gateway, ALB, Aurora instances, Fargate tasks).
+Costs accrue while the stack exists (NAT gateway, ALB, RDS instances, Fargate tasks).
 
 ```bash
 cd terraform
@@ -199,8 +206,11 @@ terraform apply -var db_deletion_protection=false
 
 # The ECR repository refuses to be deleted while it holds images. Empty it first.
 REPO_NAME=$(terraform output -raw ecr_repository_url | cut -d/ -f2)
-IDS=$(aws ecr list-images --repository-name "$REPO_NAME" --query 'imageIds[*]' --output json)
-[ "$IDS" != "[]" ] && aws ecr batch-delete-image --repository-name "$REPO_NAME" --image-ids "$IDS"
+# Repeat until empty: an image index blocks its child manifests on the first pass.
+while IDS=$(aws ecr list-images --repository-name "$REPO_NAME" --query 'imageIds[*]' --output json) \
+      && [ "$IDS" != "[]" ]; do
+  aws ecr batch-delete-image --repository-name "$REPO_NAME" --image-ids "$IDS" >/dev/null
+done
 
 terraform destroy
 ```
@@ -208,13 +218,12 @@ terraform destroy
 Afterwards, confirm nothing is left:
 
 ```bash
-aws rds describe-db-clusters --query 'DBClusters[].DBClusterIdentifier'
 aws rds describe-db-instances --query 'DBInstances[].DBInstanceIdentifier'
 aws ec2 describe-nat-gateways --filter Name=state,Values=available --query 'NatGateways[].NatGatewayId'
 aws elbv2 describe-load-balancers --query 'LoadBalancers[].LoadBalancerName'
 ```
 
-With `db_deletion_protection=false` the Aurora cluster is deleted without a final
+With `db_deletion_protection=false` the database is deleted without a final
 snapshot, and all data is lost. Take a manual snapshot first if you need it.
 
 ## CI/CD (GitHub Actions)
@@ -249,6 +258,9 @@ gh variable set AWS_APPLY_ROLE_ARN --body "<apply_role_arn>"
 
 # Optional: alarm recipients as a JSON list (unset = alarms without notifications)
 gh variable set ALARM_EMAILS --body '["ops@example.com"]'
+
+# DB master password (a secret, not a variable). Unset = Terraform generates one.
+gh secret set DB_PASSWORD     # prompts for the value, keeps it out of shell history
 ```
 
 The apply role may create CloudWatch alarms and SNS topics only with names that

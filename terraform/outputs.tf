@@ -49,23 +49,23 @@ output "log_group_name" {
 }
 
 output "db_endpoint" {
-  description = "Aurora cluster (writer) endpoint, private, reachable only from the ECS tasks."
+  description = "Primary DB endpoint, private, reachable only from the ECS tasks."
   value       = module.rds.address
 }
 
 output "db_secret_arn" {
-  description = "Secrets Manager secret holding the generated DB credentials."
-  value       = module.rds.master_user_secret_arn
+  description = "Secrets Manager secret holding the DB credentials (written by Terraform)."
+  value       = module.rds.secret_arn
 }
 
 output "db_read_endpoint" {
-  description = "Aurora reader endpoint (load-balanced across reader instances)."
+  description = "Read replica endpoint, or null when no replica exists."
   value       = module.rds.read_address
 }
 
-output "db_cluster_identifier" {
-  description = "Aurora cluster identifier (for failover tests and describe calls)."
-  value       = module.rds.cluster_identifier
+output "db_instance_identifier" {
+  description = "Primary DB instance identifier (for reboot-with-failover tests and describe calls)."
+  value       = module.rds.instance_identifier
 }
 
 output "app_url" {

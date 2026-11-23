@@ -29,8 +29,8 @@ variable "ecs_service_name" {
   type        = string
 }
 
-variable "db_cluster_identifier" {
-  description = "Aurora cluster identifier."
+variable "db_instance_identifier" {
+  description = "Primary RDS instance identifier."
   type        = string
 }
 
