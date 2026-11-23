@@ -68,14 +68,17 @@ module "rds" {
   name                       = var.name
   vpc_id                     = module.vpc.vpc_id
   subnet_ids                 = module.vpc.private_subnet_ids
-  availability_zones         = module.vpc.availability_zones
   allowed_security_group_ids = [module.ecs.tasks_security_group_id]
   engine_version             = var.db_engine_version
   instance_class             = var.db_instance_class
-  instance_count             = var.db_instance_count
-  deletion_protection        = var.db_deletion_protection
-  skip_final_snapshot        = !var.db_deletion_protection
-  tags                       = var.tags
+  password                   = var.db_password
+  multi_az                   = var.db_multi_az
+  create_read_replica        = var.db_create_read_replica
+  # The replica goes to the second AZ so reads survive the loss of the first.
+  replica_availability_zone = module.vpc.availability_zones[1]
+  deletion_protection       = var.db_deletion_protection
+  skip_final_snapshot       = !var.db_deletion_protection
+  tags                      = var.tags
 }
 
 module "ecs" {
@@ -102,9 +105,10 @@ module "ecs" {
     APP_ENV     = var.environment
     APP_VERSION = var.image_tag
     DB_HOST     = module.rds.address
-    # Reader endpoint. The current app only reads DB_HOST; DB_READ_HOST is
-    # ready for read traffic once the app routes SELECTs to it.
-    DB_READ_HOST = module.rds.read_address
+    # Read replica. The current app only reads DB_HOST; DB_READ_HOST is
+    # ready for read traffic once the app routes SELECTs to it. An empty
+    # value means no replica.
+    DB_READ_HOST = coalesce(module.rds.read_address, "")
     DB_PORT      = tostring(module.rds.port)
     DB_NAME      = module.rds.db_name
     DB_USER      = module.rds.username
@@ -113,7 +117,7 @@ module "ecs" {
   # The password stays in Secrets Manager; ECS injects it at task start.
   secrets = {
     DB_PASSWORD = {
-      secret_arn = module.rds.master_user_secret_arn
+      secret_arn = module.rds.secret_arn
       json_key   = "password"
     }
   }
@@ -136,7 +140,7 @@ module "monitoring" {
   target_group_arn_suffix = module.alb.target_group_arn_suffix
   ecs_cluster_name        = module.ecs.cluster_name
   ecs_service_name        = module.ecs.service_name
-  db_cluster_identifier   = module.rds.cluster_identifier
+  db_instance_identifier  = module.rds.instance_identifier
   # The /db-check synthetic check needs the public HTTPS name.
   health_check_fqdn = var.domain_name
   tags              = var.tags

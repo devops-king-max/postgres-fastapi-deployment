@@ -1,11 +1,11 @@
-# Finding: RDS read replica rejected, resolved with Aurora PostgreSQL
+# Finding: RDS read replica rejected, resolved with a Terraform-managed password
 
 | | |
 |---|---|
 | Date | 2026-11-23 |
-| Status | Resolved: the database moved from an RDS instance (+ read replica) to an Aurora PostgreSQL cluster (writer + reader) |
+| Status | Resolved with option A: RDS primary + read replica, master password set by Terraform. An Aurora cluster (option B) was used in between and replaced the same day for cost |
 | Requirement | "PostgreSQL in private subnets, Multi-AZ, 1 write + 1 read, failover" |
-| Met by | Aurora writer + reader in different AZs, automatic failover to the reader, master password managed in Secrets Manager |
+| Met by | RDS Multi-AZ primary (write, automatic failover to its standby) + one read replica in the second AZ; credentials in a Terraform-managed Secrets Manager secret |
 
 ## What happened
 
@@ -59,56 +59,63 @@ not a transient or permission problem.
 
 | Option | Change | Trade-off |
 |---|---|---|
-| A. Terraform-managed secret | `random_password` + an `aws_secretsmanager_secret` created by Terraform, `manage_master_user_password = false`, keep the RDS replica | Smallest change, same cost. The password is stored in Terraform state, and rotation is no longer automatic |
-| **B. Aurora PostgreSQL (chosen)** | Replace `modules/rds` with an Aurora cluster: one writer + one reader, cluster and reader endpoints | Keeps the RDS-managed password. The reader serves reads and is the failover target. Smallest instance class is `db.t4g.medium`, so it costs more |
+| **A. Terraform-managed secret (chosen)** | `manage_master_user_password = false`, password from the `DB_PASSWORD` GitHub secret (or `random_password`), written to an `aws_secretsmanager_secret` created by Terraform; keep the RDS replica | Smallest change, cheapest. The password is stored in Terraform state, and nothing rotates it |
+| B. Aurora PostgreSQL (used first, then replaced) | Replace `modules/rds` with an Aurora cluster: one writer + one reader, cluster and reader endpoints | Keeps the RDS-managed password. The reader serves reads and is the failover target. Smallest instance class is `db.t4g.medium`, so the database costs $110.58/month instead of $41.94 |
 | C. Multi-AZ DB cluster (RDS) | `aws_rds_cluster` with two readable standbys | Readable standbys and fast failover, but needs larger instance classes and costs considerably more |
 | D. Defer the reader | Deploy only the Multi-AZ primary | "1 read" not met. Briefly in place before the switch to Aurora |
 
 ## Decision and change
 
-The database is an Aurora PostgreSQL cluster (`modules/rds`):
+The database is back to RDS instances (`modules/rds`), with the password owned
+by Terraform instead of RDS:
 
-- `aws_rds_cluster` `fastapi-postgres-aurora`, engine `aurora-postgresql` 17.9,
-  `manage_master_user_password = true`, encrypted storage, private subnet group.
-- Two `aws_rds_cluster_instance` (`db.t4g.medium`): `-aurora-1` in `us-east-1a`
-  and `-aurora-2` in `us-east-1b`. Aurora picks the writer: after the first
-  deploy it was `-aurora-2`, the reverse of the `promotion_tier` order, so the
-  docs do not name a fixed writer AZ.
-- `DB_HOST` = cluster endpoint (follows the writer after failover);
-  `DB_READ_HOST` = reader endpoint. The app currently uses only `DB_HOST`.
-- Root variables `db_multi_az` and `db_create_read_replica` were replaced by
-  `db_instance_count` (default 2), `db_instance_class` and `db_engine_version`.
+- `aws_db_instance` `fastapi-postgres-db`: PostgreSQL 17, `db.t4g.micro`,
+  Multi-AZ, gp3, encrypted, private, `manage_master_user_password = false`,
+  `password` = `var.db_password` or a generated 32-character alphanumeric value
+  (`coalesce` treats an empty GitHub secret as unset).
+- `aws_db_instance` `fastapi-postgres-db-replica`: `replicate_source_db` = the
+  primary, placed in the second AZ. It inherits the credentials.
+- `aws_secretsmanager_secret` `fastapi-postgres-db-*` with the RDS-style JSON
+  (`username`, `password`, `host`, `port`, `dbname`). ECS still injects the
+  `password` key as `DB_PASSWORD`.
+- CI passes `TF_VAR_db_password` from the `DB_PASSWORD` repository secret.
+- A variable validation rejects passwords RDS would refuse (outside 8-128
+  printable ASCII characters, or containing `/`, `"`, `@` or a space) at plan
+  time instead of halfway through an apply.
+- Root variables `db_instance_count` (Aurora) were replaced by `db_multi_az`,
+  `db_create_read_replica` and `db_password`; `db_instance_class` defaults to
+  `db.t4g.micro` and `db_engine_version` to `17`.
 
-Facts checked in the account before the change: `aurora-postgresql` 17.9 is the
-default version in `us-east-1`; `db.t4g.medium` is orderable in `us-east-1a` and
-`us-east-1b`, where the private subnets are.
+Why not keep Aurora: it worked (deployed and verified end to end), but its
+smallest class is `db.t4g.medium`. Option A meets the same requirement for about
+$69/month less. The stack had been destroyed before the change, so there was no
+data to migrate.
 
-Migration impact: the existing RDS instance `fastapi-postgres-db` is destroyed
-(no final snapshot). It held no data: the ECS service had never been created, so
-no application had connected to it. Plan against the live state: 7 to add
-(cluster, 2 instances, ECS service, task definition, 2 autoscaling resources),
-1 to change (execution role policy, new secret ARN), 1 to destroy (the RDS
-instance).
+The Aurora phase, for the record: cluster `fastapi-postgres-aurora` (17.9) with
+two `db.t4g.medium` instances in `us-east-1a` and `us-east-1b`; Aurora picked
+the second instance as the writer, so writer placement is not fixed by
+`promotion_tier`.
 
 ## Cost impact
 
-About $197/month with the defaults, up from about $114 for the RDS design. The
-two Aurora instances are $106.58 of that (Price List API: $0.073/h for
-`db.t4g.medium` in `us-east-1`). Breakdown: [DESIGN.md](../DESIGN.md#estimated-monthly-cost).
+About $130/month with the defaults: the two RDS instances with storage are
+$41.94 (primary Multi-AZ $27.96, replica $13.98; Price List API, `us-east-1`).
+The Aurora design was $198.53. Breakdown: [DESIGN.md](../DESIGN.md#estimated-monthly-cost).
 
 ## Remaining risk
 
-RDS rotates the managed password every seven days by default, and ECS injects
-it only at task start. After a rotation, running tasks cannot open new
-connections until they are redeployed. The lasting fix is for the app to fetch
-the secret at connect time (see README, Known limitations).
+- The password is in Terraform state (S3 bucket, private, encrypted, versioned)
+  and in the secret. Access to the state bucket equals access to the database
+  password.
+- Nothing rotates it. A password change needs a new ECS rollout, because tasks
+  read the secret only at start (see README, Known limitations).
 
 ## Verification
 
 ```bash
-DB_CLUSTER=$(terraform output -raw db_cluster_identifier)
-aws rds describe-db-clusters --db-cluster-identifier "$DB_CLUSTER" --query \
-  'DBClusters[0].{multiAz:MultiAZ,members:DBClusterMembers[].{id:DBInstanceIdentifier,writer:IsClusterWriter}}'
+DB_ID=$(terraform output -raw db_instance_identifier)
+aws rds describe-db-instances --query \
+  "DBInstances[?starts_with(DBInstanceIdentifier, '$DB_ID')].{id:DBInstanceIdentifier,az:AvailabilityZone,multiAz:MultiAZ,source:ReadReplicaSourceDBInstanceIdentifier,managedSecret:MasterUserSecret}"
 curl -fsS https://aethrclothes.shop/db-check
-aws rds failover-db-cluster --db-cluster-identifier "$DB_CLUSTER"   # optional, brief outage
+aws rds reboot-db-instance --db-instance-identifier "$DB_ID" --force-failover   # optional, brief outage
 ```

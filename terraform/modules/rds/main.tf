@@ -30,67 +30,109 @@ resource "aws_db_subnet_group" "this" {
   tags = merge(var.tags, { Name = "${var.name}-db" })
 }
 
-# Aurora PostgreSQL: one cluster volume replicated across three AZs, one writer
-# and (instance_count - 1) readers. On writer failure Aurora promotes a reader,
-# and the cluster (writer) endpoint follows it. Unlike an RDS instance read
-# replica, Aurora readers work with an RDS-managed master password
-# (docs/read-replica-deferred.md).
-resource "aws_rds_cluster" "this" {
-  cluster_identifier = "${var.name}-aurora"
+# Generated only when no password is supplied (var.password null or empty).
+# Alphanumeric, so it never hits the characters RDS rejects (/ " @ and space).
+resource "random_password" "master" {
+  length  = 32
+  special = false
+}
 
-  engine         = "aurora-postgresql"
+locals {
+  # coalesce skips null and "", so an unset GitHub secret (empty TF_VAR) falls
+  # back to the generated password instead of failing.
+  master_password = coalesce(var.password, random_password.master.result)
+}
+
+# Terraform sets the password itself (manage_master_user_password = false):
+# an RDS instance read replica cannot be created when RDS manages the master
+# password (docs/read-replica-deferred.md). The cost of this choice: the
+# password is stored in Terraform state, and nothing rotates it.
+resource "aws_db_instance" "this" {
+  identifier = "${var.name}-db"
+
+  engine         = "postgres"
   engine_version = var.engine_version
+  instance_class = var.instance_class
 
-  database_name   = var.db_name
-  master_username = var.username
-  # RDS generates the password and keeps it in Secrets Manager, so it never
-  # lands in Terraform state or in a tfvars file.
-  manage_master_user_password = true
+  allocated_storage     = var.allocated_storage
+  max_allocated_storage = var.max_allocated_storage
+  storage_type          = "gp3"
+  storage_encrypted     = true
+
+  db_name  = var.db_name
+  username = var.username
+  password = local.master_password
 
   db_subnet_group_name   = aws_db_subnet_group.this.name
   vpc_security_group_ids = [aws_security_group.this.id]
-  storage_encrypted      = true
+  publicly_accessible    = false
+  multi_az               = var.multi_az
 
-  backup_retention_period = var.backup_retention_days
-  copy_tags_to_snapshot   = true
+  # Read replicas need automated backups on the source.
+  backup_retention_period    = var.backup_retention_days
+  auto_minor_version_upgrade = true
+  copy_tags_to_snapshot      = true
 
   deletion_protection       = var.deletion_protection
   skip_final_snapshot       = var.skip_final_snapshot
-  final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.name}-aurora-final"
+  final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.name}-db-final"
 
-  tags = var.tags
+  tags = merge(var.tags, { Role = "primary" })
 
   lifecycle {
-    # Instances apply minor upgrades automatically; without this, the next plan
-    # would try to "downgrade" to the pinned minor and fail.
-    ignore_changes = [engine_version]
+    precondition {
+      condition     = !var.create_read_replica || var.backup_retention_days > 0
+      error_message = "A read replica needs automated backups on the primary (backup_retention_days > 0)."
+    }
   }
 }
 
-# Each instance goes to a different AZ, so losing one AZ leaves an instance to
-# promote. Terraform creates the instances in parallel and Aurora picks the first
-# writer (on the first deploy it was instance 2); promotion_tier only orders
-# failover candidates. The writer can also move on every failover.
-resource "aws_rds_cluster_instance" "this" {
-  count = var.instance_count
+# Read replica: the "1 read" node. The Multi-AZ standby of the primary is for
+# failover only and cannot serve queries, so reads need a separate instance.
+# It inherits engine, credentials, encryption and DB name from the primary.
+resource "aws_db_instance" "replica" {
+  count = var.create_read_replica ? 1 : 0
 
-  identifier         = "${var.name}-aurora-${count.index + 1}"
-  cluster_identifier = aws_rds_cluster.this.id
-  engine             = aws_rds_cluster.this.engine
-  engine_version     = aws_rds_cluster.this.engine_version
-  instance_class     = var.instance_class
+  identifier          = "${var.name}-db-replica"
+  replicate_source_db = aws_db_instance.this.identifier
 
-  availability_zone    = element(var.availability_zones, count.index)
-  db_subnet_group_name = aws_db_subnet_group.this.name
-  publicly_accessible  = false
-  promotion_tier       = count.index
+  instance_class    = var.instance_class
+  storage_type      = "gp3"
+  availability_zone = var.replica_availability_zone
+
+  vpc_security_group_ids = [aws_security_group.this.id]
+  publicly_accessible    = false
+  multi_az               = false
 
   auto_minor_version_upgrade = true
   copy_tags_to_snapshot      = true
 
-  tags = merge(var.tags, { Role = count.index == 0 ? "writer" : "reader" })
+  # The primary owns backups and the final snapshot; a replica can be rebuilt.
+  skip_final_snapshot = true
+  deletion_protection = var.deletion_protection
 
-  lifecycle {
-    ignore_changes = [engine_version]
-  }
+  tags = merge(var.tags, { Role = "read-replica" })
+}
+
+# Credentials for the application, in the same JSON shape RDS uses for its own
+# managed secret, so ECS keeps reading the "password" key.
+resource "aws_secretsmanager_secret" "db" {
+  name_prefix = "${var.name}-db-"
+  description = "Master credentials of ${aws_db_instance.this.identifier} (set by Terraform)."
+  # Delete at once on destroy, so a redeploy never waits on a pending deletion.
+  recovery_window_in_days = 0
+
+  tags = var.tags
+}
+
+resource "aws_secretsmanager_secret_version" "db" {
+  secret_id = aws_secretsmanager_secret.db.id
+  secret_string = jsonencode({
+    engine   = "postgres"
+    host     = aws_db_instance.this.address
+    port     = aws_db_instance.this.port
+    dbname   = var.db_name
+    username = var.username
+    password = local.master_password
+  })
 }

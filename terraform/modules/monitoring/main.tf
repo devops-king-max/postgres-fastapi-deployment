@@ -24,7 +24,7 @@ locals {
   alb_dims = { LoadBalancer = var.alb_arn_suffix }
   tg_dims  = { LoadBalancer = var.alb_arn_suffix, TargetGroup = var.target_group_arn_suffix }
   ecs_dims = { ClusterName = var.ecs_cluster_name, ServiceName = var.ecs_service_name }
-  db_dims  = { DBClusterIdentifier = var.db_cluster_identifier, Role = "WRITER" }
+  db_dims  = { DBInstanceIdentifier = var.db_instance_identifier }
 
   # One definition per alarm. treat_missing_data: counts that are simply absent
   # when nothing goes wrong are notBreaching; "no data" for a liveness signal
@@ -67,16 +67,16 @@ locals {
       operator    = "GreaterThanThreshold", threshold = 85, missing = "notBreaching"
     }
     db-cpu-high = {
-      description = "Aurora writer CPU above 80% for 15 minutes."
+      description = "Primary DB CPU above 80% for 15 minutes."
       namespace   = "AWS/RDS", metric = "CPUUtilization", dims = local.db_dims
       statistic   = "Average", period = 300, evaluation_periods = 3
       operator    = "GreaterThanThreshold", threshold = 80, missing = "notBreaching"
     }
     db-memory-low = {
-      description = "Aurora writer freeable memory below 256 MiB for 15 minutes."
+      description = "Primary DB freeable memory below 128 MiB for 15 minutes (db.t4g.micro has 1 GiB)."
       namespace   = "AWS/RDS", metric = "FreeableMemory", dims = local.db_dims
       statistic   = "Minimum", period = 300, evaluation_periods = 3
-      operator    = "LessThanThreshold", threshold = 268435456, missing = "notBreaching"
+      operator    = "LessThanThreshold", threshold = 134217728, missing = "notBreaching"
     }
   }
 }

@@ -25,6 +25,8 @@ env:
   TF_VAR_domain_alternative_names: '["www.aethrclothes.shop"]'
   # Repository variable holding a JSON list, e.g. ["ops@example.com"].
   TF_VAR_alarm_emails: ${{ vars.ALARM_EMAILS || '[]' }}
+  # DB master password (repository secret). Empty: Terraform generates one.
+  TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
 
 defaults:
   run:

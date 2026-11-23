@@ -1,31 +1,33 @@
 output "address" {
-  description = "Cluster (writer) endpoint hostname. Follows the writer after a failover."
-  value       = aws_rds_cluster.this.endpoint
+  description = "Primary hostname (no port). Writes go here; it follows a Multi-AZ failover."
+  value       = aws_db_instance.this.address
 }
 
 output "read_address" {
-  description = "Reader endpoint hostname, load-balanced across readers (the writer when there are none)."
-  value       = aws_rds_cluster.this.reader_endpoint
+  description = "Read replica hostname, or null when no replica exists."
+  value       = one(aws_db_instance.replica[*].address)
 }
 
 output "port" {
   description = "DB port."
-  value       = aws_rds_cluster.this.port
+  value       = aws_db_instance.this.port
 }
 
 output "db_name" {
   description = "Database name."
-  value       = aws_rds_cluster.this.database_name
+  value       = aws_db_instance.this.db_name
 }
 
 output "username" {
   description = "Master username."
-  value       = aws_rds_cluster.this.master_username
+  value       = aws_db_instance.this.username
 }
 
-output "master_user_secret_arn" {
-  description = "Secrets Manager secret (JSON with username/password) managed by RDS."
-  value       = aws_rds_cluster.this.master_user_secret[0].secret_arn
+output "secret_arn" {
+  description = "Secrets Manager secret (JSON with username/password/host/port/dbname) written by Terraform."
+  # The version's arn is the secret ARN; referencing the version makes
+  # consumers (the ECS task definition) wait until the value is written.
+  value = aws_secretsmanager_secret_version.db.arn
 }
 
 output "security_group_id" {
@@ -33,7 +35,12 @@ output "security_group_id" {
   value       = aws_security_group.this.id
 }
 
-output "cluster_identifier" {
-  description = "Aurora cluster identifier."
-  value       = aws_rds_cluster.this.cluster_identifier
+output "instance_identifier" {
+  description = "Primary DB instance identifier (CloudWatch DBInstanceIdentifier dimension)."
+  value       = aws_db_instance.this.identifier
+}
+
+output "replica_identifier" {
+  description = "Read replica identifier, or null when no replica exists."
+  value       = one(aws_db_instance.replica[*].identifier)
 }
