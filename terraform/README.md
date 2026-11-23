@@ -194,7 +194,12 @@ Workflow: [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml).
 | Push to `main` | `deploy` | apply | build image (tag = commit SHA), push to ECR, `terraform apply`, wait for ECS, smoke test `/health` and `/db-check` |
 
 Authentication uses GitHub OIDC, so no AWS keys are stored in GitHub. The apply
-role can only be assumed by the `main` branch.
+role can only be assumed by jobs of the `production` GitHub environment, and that
+environment is restricted to the `main` branch (Settings > Environments >
+production > Deployment branches). A job that declares `environment:` gets an
+environment-shaped OIDC subject, so a trust policy on `ref:refs/heads/main` would
+never match it. The subjects also contain the numeric owner and repository IDs
+(`repo:<owner>@<id>/<repo>@<id>:...`).
 
 ### One-time setup
 

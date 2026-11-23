@@ -82,9 +82,12 @@ locals {
 
 data "aws_iam_policy_document" "trust" {
   for_each = {
-    # Pull requests may only plan; only the main branch may apply.
+    # Pull requests may only plan. A job that declares `environment:` gets an
+    # environment-shaped subject (not ref-shaped), so the apply role trusts the
+    # GitHub environment; restrict that environment to the main branch in the
+    # repository settings (deployment branches) to keep "only main may apply".
     plan  = "repo:${local.repo}:pull_request"
-    apply = "repo:${local.repo}:ref:refs/heads/${var.deploy_branch}"
+    apply = "repo:${local.repo}:environment:${var.deploy_environment}"
   }
 
   statement {
