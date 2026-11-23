@@ -16,7 +16,7 @@ task (private subnets, port 8000) → RDS PostgreSQL primary (port 5432).
 | Edge | Application Load Balancer, target group, HTTP (and optional HTTPS) listeners | `modules/alb` |
 | Compute | ECS cluster, Fargate service, task definition, CPU autoscaling | `modules/ecs` |
 | Image | ECR repository with scan-on-push and retention | `modules/ecr` |
-| Data | RDS PostgreSQL primary (Multi-AZ) and one read replica | `modules/rds` |
+| Data | RDS PostgreSQL primary (Multi-AZ); read replica deferred | `modules/rds` |
 | Secrets | RDS-managed master secret in Secrets Manager | `modules/rds` |
 | Observability | CloudWatch log group (`/ecs/<name>`) | `modules/ecs` |
 
@@ -57,6 +57,10 @@ The icons are from the AWS Architecture Icons set as bundled in the open-source
 - **Multi-AZ primary plus one read replica.** The Multi-AZ standby is synchronous
   and gives automatic failover, but it cannot serve queries. The replica is
   asynchronous and gives the "1 write, 1 read" shape. They solve different problems.
+  **The replica is deferred:** RDS refuses to create a read replica from a source
+  whose master password is managed by Secrets Manager (see Secrets below). The
+  diagram marks it as deferred. Report with AWS references and options:
+  [docs/read-replica-deferred.md](docs/read-replica-deferred.md).
 - **Private, encrypted, no public access.** `publicly_accessible = false`,
   `storage_encrypted = true`, subnet group on private subnets only.
 - **Safe-by-default knobs for dev, strict for prod.** `deletion_protection`
@@ -115,19 +119,18 @@ free allowance.
 | ECS Fargate, 2 tasks | $0.04048/vCPU-h, $0.004445/GB-h | 18.02 |
 | RDS primary, Multi-AZ `db.t4g.micro` | $0.032/h | 23.36 |
 | RDS primary storage, 20 GB gp3, Multi-AZ | $0.23/GB | 4.60 |
-| RDS read replica `db.t4g.micro` | $0.016/h | 11.68 |
-| RDS replica storage, 20 GB gp3 | $0.115/GB | 2.30 |
 | Secrets Manager | 1 secret | 0.40 |
 | CloudWatch Logs | 1 GB ingest + storage | 0.53 |
 | ECR | ~0.5 GB | 0.05 |
 | VPC, IGW, security groups, IAM, autoscaling | free | 0.00 |
-| **Total (default)** | | **≈ 128** |
+| **Total (default)** | | **≈ 114** |
 
 | Scenario | How | USD / month |
 |---|---|---:|
-| Default (this repo) | as above | ≈ 128 |
-| Dev-lite | `-var db_multi_az=false -var db_create_read_replica=false` | ≈ 100 |
-| Higher availability | `-var single_nat_gateway=false` (one NAT + EIP per AZ) | ≈ 164 |
+| Default (this repo) | as above | ≈ 114 |
+| Dev-lite | `-var db_multi_az=false` | ≈ 100 |
+| Higher availability | `-var single_nat_gateway=false` (one NAT + EIP per AZ) | ≈ 150 |
+| With read replica (once re-enabled) | `db.t4g.micro` replica + 20 GB gp3 | ≈ 128 |
 
 Each extra Fargate task added by autoscaling costs about $9/month while it runs.
 The fixed network cost (NAT, ALB, public IPv4) is about $66 and dominates a small
@@ -146,5 +149,5 @@ workload, so cost is mostly independent of traffic at this scale.
 | CloudWatch alarms and notifications | Not implemented |
 | Remote Terraform state (S3) | Implemented: S3 bucket and DynamoDB lock from `terraform/bootstrap` |
 | CI/CD pipeline | Implemented: GitHub Actions with OIDC (`.github/workflows/deploy.yml`); not yet run end to end |
-| App uses the read replica | Not implemented; `DB_READ_HOST` is injected but unused |
+| Read replica ("1 read") | Deferred: not supported with an RDS-managed master password, see [docs/read-replica-deferred.md](docs/read-replica-deferred.md) |
 | Secret rotation handling | Open risk: tasks read the password only at start, see README |

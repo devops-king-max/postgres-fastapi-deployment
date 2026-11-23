@@ -10,12 +10,12 @@ Internet ──► ALB (public subnets, 2 AZs)
                 │  :5432
                 ▼
    RDS PostgreSQL primary (Multi-AZ standby, auto failover)
-   RDS read replica (reads)
+   RDS read replica: deferred, see docs/read-replica-deferred.md
    Credentials: Secrets Manager (generated and owned by RDS)
 ```
 
 See [DESIGN.md](DESIGN.md) for the architecture diagram, design decisions and
-the estimated monthly cost (about $128 with the defaults).
+the estimated monthly cost (about $114 with the defaults).
 
 ## Layout
 
@@ -25,7 +25,7 @@ the estimated monthly cost (about $128 with the defaults).
 | `modules/vpc` | VPC, public/private subnets across AZs, IGW, NAT, route tables |
 | `modules/ecr` | Image repository with scan-on-push and a retention policy |
 | `modules/alb` | Public Application Load Balancer, target group, listeners |
-| `modules/rds` | PostgreSQL primary (Multi-AZ) and one read replica |
+| `modules/rds` | PostgreSQL primary (Multi-AZ); read replica code present but disabled |
 | `modules/ecs` | Cluster, task definition, service, IAM roles, logs, autoscaling |
 
 ## Prerequisites
@@ -52,10 +52,10 @@ Defaults work out of the box. Override with `-var` or a `terraform.tfvars` file 
 | `desired_count` / `max_count` | `2` / `6` | Autoscaling on CPU 60% |
 | `certificate_arn` | `null` | Set to enable HTTPS (HTTP then redirects) |
 | `db_multi_az` | `true` | Synchronous standby with automatic failover |
-| `db_create_read_replica` | `true` | One read replica |
+| `db_create_read_replica` | `false` | Must stay `false`: RDS rejects a replica of a source with a Secrets Manager-managed password ([details](docs/read-replica-deferred.md)) |
 | `db_deletion_protection` | `false` | Set `true` in production (also keeps a final snapshot) |
 
-For a cheap dev environment: `-var db_multi_az=false -var db_create_read_replica=false`.
+For a cheap dev environment: `-var db_multi_az=false`.
 
 ## Deploy
 
@@ -131,8 +131,8 @@ aws rds describe-db-instances --query \
   'DBInstances[].{id:DBInstanceIdentifier,multiAz:MultiAZ,az:AvailabilityZone,replicaOf:ReadReplicaSourceDBInstanceIdentifier,public:PubliclyAccessible}'
 ```
 
-Expect the primary with `multiAz: true`, the replica with a `replicaOf` value,
-and `public: false` for both.
+Expect one instance, the primary, with `multiAz: true` and `public: false`. The
+read replica is deferred ([details](docs/read-replica-deferred.md)).
 
 ### Testing failover (optional, causes a brief outage)
 
@@ -145,15 +145,14 @@ minute or two. Watch `/db-check` recover.
 
 ## Known limitations
 
-- The app reads only `DB_HOST`, so all queries hit the primary. `DB_READ_HOST`
-  (the replica) is injected into the container but unused until the app routes
-  `SELECT`s to it.
+- No read replica: RDS does not allow one when the source's master password is
+  managed by Secrets Manager. The Multi-AZ standby still provides failover but
+  cannot serve reads. Report, AWS references and options:
+  [docs/read-replica-deferred.md](docs/read-replica-deferred.md).
 - The database password is injected when a task starts. RDS-managed secrets are
   rotated periodically; verify rotation with
   `aws secretsmanager describe-secret --secret-id <db_secret_arn>`. After a
   rotation, running tasks may need a redeploy to pick up the new password.
-- The default listener is HTTP only. Set `certificate_arn` for HTTPS.
-- Terraform state is local. Use an S3 backend with locking for team use.
 
 ## Cleanup
 

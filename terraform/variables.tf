@@ -112,9 +112,15 @@ variable "db_multi_az" {
 }
 
 variable "db_create_read_replica" {
-  description = "Create one read replica for read traffic."
+  description = "Create one read replica for read traffic. Deferred: see docs/read-replica-deferred.md."
   type        = bool
-  default     = true
+  default     = false
+
+  # Fail at plan time instead of after the primary has been built (~15 min).
+  validation {
+    condition     = !var.db_create_read_replica
+    error_message = "RDS does not allow a read replica of a source whose master password is managed by Secrets Manager (manage_master_user_password = true in modules/rds). See terraform/docs/read-replica-deferred.md for the options."
+  }
 }
 
 variable "db_deletion_protection" {

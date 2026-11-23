@@ -67,6 +67,8 @@ resource "aws_db_instance" "this" {
 # Read replica: the "1 read" node. The Multi-AZ standby of the primary is for
 # failover only and cannot serve queries, so reads need a separate instance.
 # It inherits engine, credentials, encryption and DB name from the primary.
+# Currently unusable: RDS rejects CreateDBInstanceReadReplica when the source has
+# manage_master_user_password = true (docs/read-replica-deferred.md).
 resource "aws_db_instance" "replica" {
   count = var.create_read_replica ? 1 : 0
 
