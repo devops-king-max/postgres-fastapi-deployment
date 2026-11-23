@@ -8,7 +8,8 @@ ECS Fargate stack. For deploy, verify and cleanup steps see [README.md](README.m
 ![Architecture diagram](docs/architecture.svg)
 
 Request path: Client → Internet Gateway → ALB (public subnets) → ECS Fargate
-task (private subnets, port 8000) → RDS PostgreSQL primary (port 5432).
+task (private subnets, port 8000) → Aurora PostgreSQL cluster endpoint, i.e. the
+writer (port 5432).
 
 | Layer | Resource | Module |
 |---|---|---|
@@ -16,7 +17,7 @@ task (private subnets, port 8000) → RDS PostgreSQL primary (port 5432).
 | Edge | Application Load Balancer, target group, HTTP (and optional HTTPS) listeners | `modules/alb` |
 | Compute | ECS cluster, Fargate service, task definition, CPU autoscaling | `modules/ecs` |
 | Image | ECR repository with scan-on-push and retention | `modules/ecr` |
-| Data | RDS PostgreSQL primary (Multi-AZ) and one read replica | `modules/rds` |
+| Data | Aurora PostgreSQL cluster: 1 writer + 1 reader in different AZs | `modules/rds` |
 | Secrets | RDS-managed master secret in Secrets Manager | `modules/rds` |
 | Observability | CloudWatch log group (`/ecs/<name>`) | `modules/ecs` |
 
@@ -53,10 +54,27 @@ The icons are from the AWS Architecture Icons set as bundled in the open-source
   for the same platform, otherwise tasks fail with `exec format error`.
 
 ### Database
-- **RDS instead of a Postgres container.** Fargate has no durable local volume.
-- **Multi-AZ primary plus one read replica.** The Multi-AZ standby is synchronous
-  and gives automatic failover, but it cannot serve queries. The replica is
-  asynchronous and gives the "1 write, 1 read" shape. They solve different problems.
+- **Managed database instead of a Postgres container.** Fargate has no durable
+  local volume.
+- **Aurora PostgreSQL, 1 writer + 1 reader.** The first design (RDS instance,
+  Multi-AZ, plus an instance read replica) failed on deploy: RDS does not allow a
+  read replica of an instance whose master password is managed by Secrets
+  Manager. Aurora readers are cluster members that share the cluster volume, so
+  they work with a managed password. One reader covers both needs: it serves
+  reads through the reader endpoint and is the failover target, so nothing sits
+  idle the way an RDS Multi-AZ standby does. History, AWS references and the
+  alternatives: [docs/read-replica-deferred.md](docs/read-replica-deferred.md).
+- **Failover.** The cluster volume keeps six copies across three AZs. The writer
+  and reader run in different AZs (`promotion_tier` 0 and 1). If the writer fails,
+  Aurora promotes the reader, typically within about a minute or less, and the
+  cluster endpoint (`DB_HOST`) moves with it, so the app needs no configuration
+  change.
+- **`db.t4g.medium` and version 17.9.** The smallest provisioned class Aurora
+  PostgreSQL offers, and AWS's current default version (both checked in
+  `us-east-1` with `describe-orderable-db-instance-options` and
+  `describe-db-engine-versions`). Instances take minor upgrades automatically, and
+  Terraform ignores `engine_version` drift so the next plan does not try to
+  downgrade.
 - **Private, encrypted, no public access.** `publicly_accessible = false`,
   `storage_encrypted = true`, subnet group on private subnets only.
 - **Safe-by-default knobs for dev, strict for prod.** `deletion_protection`
@@ -101,42 +119,51 @@ The icons are from the AWS Architecture Icons set as bundled in the open-source
 ## Estimated monthly cost
 
 Assumptions: `us-east-1`, on-demand, Linux x86, 730 hours/month, defaults of this
-repo (2 AZs, 2 tasks of 0.25 vCPU / 0.5 GB, `db.t4g.micro`, 20 GB gp3), 20 GB NAT
-traffic, about 1 LCU, 1 GB of logs. Data transfer out stays inside the 100 GB/month
-free allowance.
+repo (2 AZs, 2 tasks of 0.25 vCPU / 0.5 GB, Aurora 2 × `db.t4g.medium`), 20 GB
+NAT traffic, about 1 LCU, 1 GB of logs. Data transfer out stays inside the 100
+GB/month free allowance.
 
-| Item | Basis | USD / month |
+Non-database rows come from the AWS Pricing Calculator (estimate date
+2026-11-23). The calculator estimates were built for the earlier RDS design, so
+their totals no longer match this stack. The Aurora rows come from the AWS Price
+List API (`aws pricing get-products`, `us-east-1`, queried 2026-11-23); they have
+not yet been entered into a calculator estimate.
+
+| Item (calculator service) | Calculator input | USD / month |
 |---|---|---:|
-| NAT Gateway (1) | $0.045/h | 32.85 |
-| NAT data processing | 20 GB × $0.045 | 0.90 |
-| Public IPv4 (NAT EIP + 2 ALB IPs) | 3 × $0.005/h | 10.95 |
-| Application Load Balancer | $0.0225/h | 16.43 |
-| ALB capacity (LCU) | ~1 LCU × $0.008/h | 5.84 |
-| ECS Fargate, 2 tasks | $0.04048/vCPU-h, $0.004445/GB-h | 18.02 |
-| RDS primary, Multi-AZ `db.t4g.micro` | $0.032/h | 23.36 |
-| RDS primary storage, 20 GB gp3, Multi-AZ | $0.23/GB | 4.60 |
-| RDS read replica `db.t4g.micro` | $0.016/h | 11.68 |
-| RDS replica storage, 20 GB gp3 | $0.115/GB | 2.30 |
-| Secrets Manager | 1 secret | 0.40 |
-| CloudWatch Logs | 1 GB ingest + storage | 0.53 |
-| ECR | ~0.5 GB | 0.05 |
-| VPC, IGW, security groups, IAM, autoscaling | free | 0.00 |
-| **Total (default)** | | **≈ 128** |
+| NAT Gateway (VPC) | 1 gateway, 20 GB processed | 33.75 |
+| Public IPv4 (VPC) | 3 in-use addresses (NAT EIP + 2 ALB IPs) | 10.95 |
+| Application Load Balancer | 1 ALB, 1 GB/h processed, 1 new conn/s, 1 req/s (≈ 1 LCU) | 22.27 |
+| AWS Fargate | 2 tasks × 730 h, 0.25 vCPU / 0.5 GB, Linux x86, 20 GB ephemeral | 18.02 |
+| Aurora PostgreSQL instances (Price List API) | 2 × `db.t4g.medium` × 730 h × $0.073 | 106.58 |
+| Aurora storage (Price List API) | 20 GB consumed × $0.10 (Aurora Standard) | 2.00 |
+| Aurora I/O (Price List API) | 10 million requests × $0.20 per million (assumed) | 2.00 |
+| Secrets Manager | 1 secret, 1,000 API calls | 0.41 |
+| CloudWatch Logs | 1 GB ingested, stored 1 month | 0.50 |
+| ECR | 0.5 GB stored | 0.05 |
+| VPC, IGW, security groups, IAM, autoscaling | not billed | 0.00 |
+| **Total (default)** | | **196.53** |
 
 | Scenario | How | USD / month |
 |---|---|---:|
-| Default (this repo) | as above | ≈ 128 |
-| Dev-lite | `-var db_multi_az=false -var db_create_read_replica=false` | ≈ 100 |
-| Higher availability | `-var single_nat_gateway=false` (one NAT + EIP per AZ) | ≈ 164 |
+| Default (this repo) | as above | 196.53 |
+| Dev-lite | `-var db_instance_count=1` (writer only, no readable failover target; Aurora −53.29) | 143.24 |
+| Higher availability | `-var single_nat_gateway=false` (2 NAT × 10 GB: 66.60; 4 public IPv4: 14.60; calculator figures) | 233.03 |
+| Earlier RDS design, for comparison | `db.t4g.micro` Multi-AZ, no reader ([calculator estimate](https://calculator.aws/#/estimate?id=baaf3d0e788b1c454b25826137ba9463874085a6)) | 113.91 |
 
-Each extra Fargate task added by autoscaling costs about $9/month while it runs.
-The fixed network cost (NAT, ALB, public IPv4) is about $66 and dominates a small
-workload, so cost is mostly independent of traffic at this scale.
+Aurora is the largest item (110.58 of 196.53): its smallest provisioned class is
+`db.t4g.medium`, and every instance is billed, including the reader. The
+"1 write, 1 read" requirement is what costs about $83/month more than the
+earlier RDS design. Each extra Fargate task added by autoscaling costs about
+$9/month while it runs (half of the 18.02 above). The fixed network cost (NAT,
+public IPv4, ALB) is 66.97.
 
-> **These figures are estimates from unit prices recalled from AWS's public price
-> list, not from a live price query.** Prices differ by region (for example
-> `ap-southeast-1` is typically higher) and change over time. Check the final
-> number in the [AWS Pricing Calculator](https://calculator.aws/) before relying on it.
+> Calculator figures are on-demand list prices for `us-east-1` and exclude tax,
+> free tier, data transfer out (assumed inside the 100 GB/month free allowance),
+> Aurora backup storage beyond the free allocation, and Fargate public IPs (tasks
+> run in private subnets). Aurora storage and I/O depend on data size and query
+> volume; 20 GB and 10 million I/Os are assumptions for a small API. Prices differ
+> by region and change over time.
 
 ## Not implemented yet
 
@@ -146,5 +173,5 @@ workload, so cost is mostly independent of traffic at this scale.
 | CloudWatch alarms and notifications | Not implemented |
 | Remote Terraform state (S3) | Implemented: S3 bucket and DynamoDB lock from `terraform/bootstrap` |
 | CI/CD pipeline | Implemented: GitHub Actions with OIDC (`.github/workflows/deploy.yml`); not yet run end to end |
-| App uses the read replica | Not implemented; `DB_READ_HOST` is injected but unused |
-| Secret rotation handling | Open risk: tasks read the password only at start, see README |
+| "1 write, 1 read" | Implemented with Aurora (writer + reader). The app still sends all queries to `DB_HOST`; `DB_READ_HOST` (reader endpoint) is injected but unused |
+| Secret rotation handling | **Open risk:** RDS rotates the managed password every 7 days by default, and tasks read it only at start. Running tasks will fail to open new DB connections after a rotation until they are redeployed. See README |

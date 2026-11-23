@@ -49,7 +49,7 @@ output "log_group_name" {
 }
 
 output "db_endpoint" {
-  description = "Database hostname (private, reachable only from the ECS tasks)."
+  description = "Aurora cluster (writer) endpoint, private, reachable only from the ECS tasks."
   value       = module.rds.address
 }
 
@@ -59,8 +59,13 @@ output "db_secret_arn" {
 }
 
 output "db_read_endpoint" {
-  description = "Read replica hostname (null when disabled)."
+  description = "Aurora reader endpoint (load-balanced across reader instances)."
   value       = module.rds.read_address
+}
+
+output "db_cluster_identifier" {
+  description = "Aurora cluster identifier (for failover tests and describe calls)."
+  value       = module.rds.cluster_identifier
 }
 
 output "app_url" {

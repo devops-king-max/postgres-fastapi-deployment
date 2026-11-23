@@ -96,7 +96,14 @@ jobs:
           REPO=$(terraform output -raw ecr_repository_url)
           # Runner is x86_64, matching the default cpu_architecture (X86_64).
           docker build --platform linux/amd64 -t "$REPO:${{ github.sha }}" ../k8s-event-api
-          docker push "$REPO:${{ github.sha }}"
+          # Retry: pushes occasionally time out on the runner's network path to ECR.
+          # Layers already uploaded are skipped on the next attempt.
+          for attempt in 1 2 3 4; do
+            docker push "$REPO:${{ github.sha }}" && break
+            [ "$attempt" = 4 ] && exit 1
+            echo "push attempt $attempt failed, retrying in 20s"
+            sleep 20
+          done
 
       - name: Apply
         run: terraform apply -input=false -auto-approve -lock-timeout=5m -var "image_tag=${{ github.sha }}"

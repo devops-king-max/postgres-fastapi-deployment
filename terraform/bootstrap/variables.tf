@@ -28,10 +28,10 @@ variable "github_repo_id" {
   default     = "1468483451"
 }
 
-variable "deploy_branch" {
-  description = "Only this branch may assume the apply role."
+variable "deploy_environment" {
+  description = "GitHub environment whose jobs may assume the apply role. Limit its deployment branches to main in the repository settings."
   type        = string
-  default     = "main"
+  default     = "production"
 }
 
 variable "app_name" {
