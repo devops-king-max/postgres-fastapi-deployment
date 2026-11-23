@@ -1,5 +1,5 @@
 variable "name" {
-  description = "Name prefix for the database and its security group."
+  description = "Name prefix for the cluster, its instances and its security group."
   type        = string
 }
 
@@ -14,7 +14,17 @@ variable "subnet_ids" {
 
   validation {
     condition     = length(var.subnet_ids) >= 2
-    error_message = "RDS needs subnets in at least two AZs."
+    error_message = "The DB subnet group needs subnets in at least two AZs."
+  }
+}
+
+variable "availability_zones" {
+  description = "AZs of subnet_ids. Instance N is placed in availability_zones[N % length]."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.availability_zones) >= 2
+    error_message = "Spread instances over at least two AZs."
   }
 }
 
@@ -24,27 +34,26 @@ variable "allowed_security_group_ids" {
 }
 
 variable "engine_version" {
-  description = "PostgreSQL engine version. A major-only value (e.g. 16) lets RDS pick the current minor."
+  description = "Aurora PostgreSQL version (major.minor). List with: aws rds describe-db-engine-versions --engine aurora-postgresql."
   type        = string
-  default     = "16"
+  default     = "17.9"
 }
 
 variable "instance_class" {
-  description = "RDS instance class."
+  description = "Instance class for every cluster instance. db.t4g.medium is the smallest provisioned class for Aurora PostgreSQL."
   type        = string
-  default     = "db.t4g.micro"
+  default     = "db.t4g.medium"
 }
 
-variable "allocated_storage" {
-  description = "Initial storage in GiB."
+variable "instance_count" {
+  description = "Cluster instances: 1 writer + (count - 1) readers. Use 2 or more for a readable failover target."
   type        = number
-  default     = 20
-}
+  default     = 2
 
-variable "max_allocated_storage" {
-  description = "Storage autoscaling ceiling in GiB (0 disables autoscaling)."
-  type        = number
-  default     = 100
+  validation {
+    condition     = var.instance_count >= 1 && var.instance_count <= 16
+    error_message = "An Aurora cluster holds 1 to 16 instances."
+  }
 }
 
 variable "db_name" {
@@ -59,26 +68,8 @@ variable "username" {
   default     = "events_user"
 }
 
-variable "multi_az" {
-  description = "Synchronous standby in a second AZ with automatic failover (roughly doubles primary cost)."
-  type        = bool
-  default     = true
-}
-
-variable "create_read_replica" {
-  description = "Create one read replica for read traffic."
-  type        = bool
-  default     = true
-}
-
-variable "replica_availability_zone" {
-  description = "AZ for the read replica. Null lets AWS choose; set it to spread away from the primary."
-  type        = string
-  default     = null
-}
-
 variable "backup_retention_days" {
-  description = "Automated backup retention. 0 disables backups."
+  description = "Automated backup retention in days (Aurora minimum is 1)."
   type        = number
   default     = 7
 }

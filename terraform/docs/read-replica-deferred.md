@@ -1,18 +1,17 @@
-# Finding: RDS read replica deferred
+# Finding: RDS read replica rejected, resolved with Aurora PostgreSQL
 
 | | |
 |---|---|
 | Date | 2026-11-23 |
-| Status | Read replica not deployed (decision: defer) |
-| Affected requirement | "RDS PostgreSQL Multi-AZ, 1 write + 1 read, failover" |
-| Still met | 1 writer, Multi-AZ synchronous standby, automatic failover, credentials in Secrets Manager |
-| Not met | The separate readable node ("1 read") |
+| Status | Resolved: the database moved from an RDS instance (+ read replica) to an Aurora PostgreSQL cluster (writer + reader) |
+| Requirement | "PostgreSQL in private subnets, Multi-AZ, 1 write + 1 read, failover" |
+| Met by | Aurora writer (AZ a) + reader (AZ b), automatic failover to the reader, master password managed in Secrets Manager |
 
 ## What happened
 
 The first full `terraform apply` from the `deploy` workflow on `main` created the
-primary instance `fastapi-postgres-db` (Multi-AZ, 14m22s), then failed on the
-replica:
+RDS primary instance `fastapi-postgres-db` (Multi-AZ, 14m22s), then failed on the
+read replica:
 
 ```text
 Error: creating RDS DB Instance (read replica) (fastapi-postgres-db-replica):
@@ -26,7 +25,7 @@ engine postgres where ManageMasterUserPassword is enabled is not supported.
 
 ## Root cause
 
-The primary is created with `manage_master_user_password = true`: RDS generates
+The primary was created with `manage_master_user_password = true`: RDS generates
 the master password and stores it in AWS Secrets Manager, so it never appears in
 Terraform code or state. RDS does not support creating a read replica from a
 source that manages its master password this way. The design combined the two
@@ -43,43 +42,72 @@ features without checking that limitation.
 - [Working with read replicas for Amazon RDS for PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_PostgreSQL.Replication.ReadReplicas.html):
   the PostgreSQL replica page does not repeat this restriction in its own
   limitations list, which is how it was missed at design time.
+- [Password management with Amazon Aurora and AWS Secrets Manager](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/rds-secrets-manager.html),
+  section *Limitations*: for Aurora, managed master passwords are unsupported
+  only for Blue/Green Deployments, clusters in an Aurora global database,
+  cross-Region read replicas, and binary log external replication. Reader
+  instances inside the same cluster are not on the list: they are cluster
+  members sharing the cluster volume, not replicas created from a source
+  instance. The same page states that the managed password is rotated every
+  seven days by default.
 
 The API error above (HTTP 400, `InvalidParameterValue`) is the direct evidence
-from this account; the documentation confirms it is a documented limitation,
+from this account. The documentation confirms it is a documented limitation,
 not a transient or permission problem.
 
-## Decision
-
-Deploy without the read replica for now.
-
-- `db_create_read_replica` now defaults to `false`, and a variable validation
-  rejects `true` at plan time, so nobody waits for a 15-minute primary build
-  before hitting the same error.
-- The replica resource stays in `modules/rds` for the follow-up below.
-- `DB_READ_HOST` is no longer injected (it is only set when the replica exists).
-  The application never used it: all queries already went to `DB_HOST`.
-- Cost drops by about $14/month (replica instance and storage).
-
-The Multi-AZ standby still gives automatic failover. It cannot serve reads,
-which is why the "1 read" part of the requirement is open.
-
-## Options to restore "1 read"
+## Options considered
 
 | Option | Change | Trade-off |
 |---|---|---|
-| A. Terraform-managed secret | `random_password` + an `aws_secretsmanager_secret` created by Terraform, `manage_master_user_password = false` on the primary (in-place modify, no rebuild), re-enable the replica | Smallest change, same cost. The password is stored in Terraform state (the S3 bucket is encrypted and readable only by the CI roles and admins). Rotation is no longer automatic. Not yet tested in this account |
-| B. Aurora PostgreSQL | Replace `modules/rds` with an Aurora cluster: one writer + one reader, reader endpoint, failover to the reader | Supports managed passwords with readers. Larger rewrite, the current instance is replaced, higher cost |
+| A. Terraform-managed secret | `random_password` + an `aws_secretsmanager_secret` created by Terraform, `manage_master_user_password = false`, keep the RDS replica | Smallest change, same cost. The password is stored in Terraform state, and rotation is no longer automatic |
+| **B. Aurora PostgreSQL (chosen)** | Replace `modules/rds` with an Aurora cluster: one writer + one reader, cluster and reader endpoints | Keeps the RDS-managed password. The reader serves reads and is the failover target. Smallest instance class is `db.t4g.medium`, so it costs more |
 | C. Multi-AZ DB cluster (RDS) | `aws_rds_cluster` with two readable standbys | Readable standbys and fast failover, but needs larger instance classes and costs considerably more |
+| D. Defer the reader | Deploy only the Multi-AZ primary | "1 read" not met. Briefly in place before the switch to Aurora |
 
-Option A is the recommended follow-up when the read node is required.
+## Decision and change
+
+The database is an Aurora PostgreSQL cluster (`modules/rds`):
+
+- `aws_rds_cluster` `fastapi-postgres-aurora`, engine `aurora-postgresql` 17.9,
+  `manage_master_user_password = true`, encrypted storage, private subnet group.
+- Two `aws_rds_cluster_instance` (`db.t4g.medium`): `-aurora-1` in `us-east-1a`
+  (writer, `promotion_tier` 0) and `-aurora-2` in `us-east-1b` (reader,
+  `promotion_tier` 1).
+- `DB_HOST` = cluster endpoint (follows the writer after failover);
+  `DB_READ_HOST` = reader endpoint. The app currently uses only `DB_HOST`.
+- Root variables `db_multi_az` and `db_create_read_replica` were replaced by
+  `db_instance_count` (default 2), `db_instance_class` and `db_engine_version`.
+
+Facts checked in the account before the change: `aurora-postgresql` 17.9 is the
+default version in `us-east-1`; `db.t4g.medium` is orderable in `us-east-1a` and
+`us-east-1b`, where the private subnets are.
+
+Migration impact: the existing RDS instance `fastapi-postgres-db` is destroyed
+(no final snapshot). It held no data: the ECS service had never been created, so
+no application had connected to it. Plan against the live state: 7 to add
+(cluster, 2 instances, ECS service, task definition, 2 autoscaling resources),
+1 to change (execution role policy, new secret ARN), 1 to destroy (the RDS
+instance).
+
+## Cost impact
+
+About $197/month with the defaults, up from about $114 for the RDS design. The
+two Aurora instances are $106.58 of that (Price List API: $0.073/h for
+`db.t4g.medium` in `us-east-1`). Breakdown: [DESIGN.md](../DESIGN.md#estimated-monthly-cost).
+
+## Remaining risk
+
+RDS rotates the managed password every seven days by default, and ECS injects
+it only at task start. After a rotation, running tasks cannot open new
+connections until they are redeployed. The lasting fix is for the app to fetch
+the secret at connect time (see README, Known limitations).
 
 ## Verification
 
 ```bash
-# Primary exists, Multi-AZ, no replica
-aws rds describe-db-instances --query \
-  'DBInstances[].{id:DBInstanceIdentifier,multiAz:MultiAZ,replicaOf:ReadReplicaSourceDBInstanceIdentifier}'
-
-# Plan with the replica enabled is rejected before any API call
-terraform plan -var db_create_read_replica=true   # fails in variable validation
+DB_CLUSTER=$(terraform output -raw db_cluster_identifier)
+aws rds describe-db-clusters --db-cluster-identifier "$DB_CLUSTER" --query \
+  'DBClusters[0].{multiAz:MultiAZ,members:DBClusterMembers[].{id:DBInstanceIdentifier,writer:IsClusterWriter}}'
+curl -fsS https://aethrclothes.shop/db-check
+aws rds failover-db-cluster --db-cluster-identifier "$DB_CLUSTER"   # optional, brief outage
 ```

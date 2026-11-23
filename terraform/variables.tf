@@ -105,22 +105,22 @@ variable "dns_zone_name" {
   default     = null
 }
 
-variable "db_multi_az" {
-  description = "Run the primary with a synchronous standby in a second AZ (automatic failover)."
-  type        = bool
-  default     = true
+variable "db_instance_count" {
+  description = "Aurora instances: 1 writer + (count - 1) readers, spread over the AZs. 2 = one write, one read, readable failover target."
+  type        = number
+  default     = 2
 }
 
-variable "db_create_read_replica" {
-  description = "Create one read replica for read traffic. Deferred: see docs/read-replica-deferred.md."
-  type        = bool
-  default     = false
+variable "db_instance_class" {
+  description = "Aurora instance class (db.t4g.medium is the smallest provisioned class)."
+  type        = string
+  default     = "db.t4g.medium"
+}
 
-  # Fail at plan time instead of after the primary has been built (~15 min).
-  validation {
-    condition     = !var.db_create_read_replica
-    error_message = "RDS does not allow a read replica of a source whose master password is managed by Secrets Manager (manage_master_user_password = true in modules/rds). See terraform/docs/read-replica-deferred.md for the options."
-  }
+variable "db_engine_version" {
+  description = "Aurora PostgreSQL version (major.minor)."
+  type        = string
+  default     = "17.9"
 }
 
 variable "db_deletion_protection" {

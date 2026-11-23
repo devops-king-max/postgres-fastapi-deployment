@@ -30,65 +30,65 @@ resource "aws_db_subnet_group" "this" {
   tags = merge(var.tags, { Name = "${var.name}-db" })
 }
 
-resource "aws_db_instance" "this" {
-  identifier = "${var.name}-db"
+# Aurora PostgreSQL: one cluster volume replicated across three AZs, one writer
+# and (instance_count - 1) readers. On writer failure Aurora promotes a reader,
+# and the cluster (writer) endpoint follows it. Unlike an RDS instance read
+# replica, Aurora readers work with an RDS-managed master password
+# (docs/read-replica-deferred.md).
+resource "aws_rds_cluster" "this" {
+  cluster_identifier = "${var.name}-aurora"
 
-  engine         = "postgres"
+  engine         = "aurora-postgresql"
   engine_version = var.engine_version
-  instance_class = var.instance_class
 
-  allocated_storage     = var.allocated_storage
-  max_allocated_storage = var.max_allocated_storage
-  storage_type          = "gp3"
-  storage_encrypted     = true
-
-  db_name  = var.db_name
-  username = var.username
+  database_name   = var.db_name
+  master_username = var.username
   # RDS generates the password and keeps it in Secrets Manager, so it never
   # lands in Terraform state or in a tfvars file.
   manage_master_user_password = true
 
   db_subnet_group_name   = aws_db_subnet_group.this.name
   vpc_security_group_ids = [aws_security_group.this.id]
-  publicly_accessible    = false
-  multi_az               = var.multi_az
+  storage_encrypted      = true
 
-  backup_retention_period    = var.backup_retention_days
-  auto_minor_version_upgrade = true
-  copy_tags_to_snapshot      = true
+  backup_retention_period = var.backup_retention_days
+  copy_tags_to_snapshot   = true
 
   deletion_protection       = var.deletion_protection
   skip_final_snapshot       = var.skip_final_snapshot
-  final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.name}-db-final"
+  final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.name}-aurora-final"
 
   tags = var.tags
+
+  lifecycle {
+    # Instances apply minor upgrades automatically; without this, the next plan
+    # would try to "downgrade" to the pinned minor and fail.
+    ignore_changes = [engine_version]
+  }
 }
 
-# Read replica: the "1 read" node. The Multi-AZ standby of the primary is for
-# failover only and cannot serve queries, so reads need a separate instance.
-# It inherits engine, credentials, encryption and DB name from the primary.
-# Currently unusable: RDS rejects CreateDBInstanceReadReplica when the source has
-# manage_master_user_password = true (docs/read-replica-deferred.md).
-resource "aws_db_instance" "replica" {
-  count = var.create_read_replica ? 1 : 0
+# Instance 1 is created first and becomes the writer. Each instance goes to a
+# different AZ, so losing one AZ leaves a reader to promote.
+resource "aws_rds_cluster_instance" "this" {
+  count = var.instance_count
 
-  identifier          = "${var.name}-db-replica"
-  replicate_source_db = aws_db_instance.this.identifier
+  identifier         = "${var.name}-aurora-${count.index + 1}"
+  cluster_identifier = aws_rds_cluster.this.id
+  engine             = aws_rds_cluster.this.engine
+  engine_version     = aws_rds_cluster.this.engine_version
+  instance_class     = var.instance_class
 
-  instance_class    = var.instance_class
-  storage_type      = "gp3"
-  availability_zone = var.replica_availability_zone
-
-  vpc_security_group_ids = [aws_security_group.this.id]
-  publicly_accessible    = false
-  multi_az               = false
+  availability_zone    = element(var.availability_zones, count.index)
+  db_subnet_group_name = aws_db_subnet_group.this.name
+  publicly_accessible  = false
+  promotion_tier       = count.index
 
   auto_minor_version_upgrade = true
   copy_tags_to_snapshot      = true
 
-  # The primary owns backups and the final snapshot; a replica can be rebuilt.
-  skip_final_snapshot = true
-  deletion_protection = var.deletion_protection
+  tags = merge(var.tags, { Role = count.index == 0 ? "writer" : "reader" })
 
-  tags = merge(var.tags, { Role = "read-replica" })
+  lifecycle {
+    ignore_changes = [engine_version]
+  }
 }

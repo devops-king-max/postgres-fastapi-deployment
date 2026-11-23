@@ -68,9 +68,11 @@ module "rds" {
   name                       = var.name
   vpc_id                     = module.vpc.vpc_id
   subnet_ids                 = module.vpc.private_subnet_ids
+  availability_zones         = module.vpc.availability_zones
   allowed_security_group_ids = [module.ecs.tasks_security_group_id]
-  multi_az                   = var.db_multi_az
-  create_read_replica        = var.db_create_read_replica
+  engine_version             = var.db_engine_version
+  instance_class             = var.db_instance_class
+  instance_count             = var.db_instance_count
   deletion_protection        = var.db_deletion_protection
   skip_final_snapshot        = !var.db_deletion_protection
   tags                       = var.tags
@@ -95,20 +97,18 @@ module "ecs" {
   ecr_repository_arns        = [module.ecr.repository_arn]
   database_security_group_id = module.rds.security_group_id
 
-  environment = merge(
-    {
-      APP_NAME    = var.name
-      APP_ENV     = var.environment
-      APP_VERSION = var.image_tag
-      DB_HOST     = module.rds.address
-      DB_PORT     = tostring(module.rds.port)
-      DB_NAME     = module.rds.db_name
-      DB_USER     = module.rds.username
-    },
-    # The current app only reads DB_HOST; DB_READ_HOST is provided for read
-    # traffic once the app routes SELECTs to it.
-    var.db_create_read_replica ? { DB_READ_HOST = module.rds.read_address } : {}
-  )
+  environment = {
+    APP_NAME    = var.name
+    APP_ENV     = var.environment
+    APP_VERSION = var.image_tag
+    DB_HOST     = module.rds.address
+    # Reader endpoint. The current app only reads DB_HOST; DB_READ_HOST is
+    # ready for read traffic once the app routes SELECTs to it.
+    DB_READ_HOST = module.rds.read_address
+    DB_PORT      = tostring(module.rds.port)
+    DB_NAME      = module.rds.db_name
+    DB_USER      = module.rds.username
+  }
 
   # The password stays in Secrets Manager; ECS injects it at task start.
   secrets = {
