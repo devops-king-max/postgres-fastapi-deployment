@@ -100,6 +100,12 @@ resource "aws_db_instance" "replica" {
   storage_type      = "gp3"
   availability_zone = var.replica_availability_zone
 
+  # The replica inherits these from the primary. Left unset, the provider plans
+  # true -> null for storage_encrypted, which forces a replacement on every
+  # apply (and the re-create can fail while the primary is not "available").
+  storage_encrypted     = true
+  max_allocated_storage = var.max_allocated_storage
+
   vpc_security_group_ids = [aws_security_group.this.id]
   publicly_accessible    = false
   multi_az               = false
