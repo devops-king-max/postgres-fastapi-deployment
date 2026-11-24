@@ -152,6 +152,23 @@ resource "aws_iam_role_policy_attachment" "plan_readonly" {
   policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
 }
 
+# ReadOnlyAccess does not include secretsmanager:GetSecretValue, but refreshing
+# aws_secretsmanager_secret_version needs it, so plan failed with AccessDenied.
+# This exposes nothing new: the plan role already reads the state, which holds
+# the same password. Scoped to the DB credentials secret only.
+data "aws_iam_policy_document" "plan_db_secret" {
+  statement {
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:${local.name_prefix}-db-*"]
+  }
+}
+
+resource "aws_iam_role_policy" "plan_db_secret" {
+  name   = "read-db-secret"
+  role   = aws_iam_role.ci["plan"].id
+  policy = data.aws_iam_policy_document.plan_db_secret.json
+}
+
 # Apply role: service-level access to exactly the services this stack uses.
 # IAM is limited to roles/policies named after the app, so the pipeline cannot
 # mint an admin role.
