@@ -175,6 +175,18 @@ curl -s "$URL/events?limit=5"                                        # read path
 curl -s "$URL/stats"
 ```
 
+Responses from the deployed stack at `https://aethrclothes.shop`:
+
+| Endpoint | Response |
+|---|---|
+| `/`: app name, environment and the deployed commit SHA | ![GET / response](terraform/docs/verify-root.png) |
+| `/health`: liveness, no database access | ![GET /health response](terraform/docs/verify-health.png) |
+| `/db-check`: the task reaches the RDS primary | ![GET /db-check response](terraform/docs/verify-db-check.png) |
+
+The `pod` field is the task's private hostname. `ip-10-0-100-x` is a task in the
+AZ A private subnet and `ip-10-0-101-x` one in AZ B, so repeated requests show
+the ALB spreading traffic across both AZs.
+
 **3. HTTPS is enforced**
 
 ```bash
